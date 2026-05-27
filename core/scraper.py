@@ -564,6 +564,7 @@ async def scrape_leads(
     country: str = "BR",
     progress_cb: Optional[Callable[[int, dict], Awaitable[None]]] = None,
     pool=None,
+    place_cache=None,  # Optional[PlaceCache] — per-URL extraction cache
 ) -> list[dict]:
     """
     Scrape Google Maps for businesses matching *keyword* in *city*.
@@ -575,6 +576,10 @@ async def scrape_leads(
 
     progress_cb(n, lead_dict) fires after each lead is extracted so the
     caller can persist and stream the lead immediately.
+
+    place_cache (optional): a PlaceCache instance; when provided, each
+    place URL is checked against the cache before Playwright extraction,
+    and results are stored in the cache after a successful extraction.
     """
     localidade = f"{city} {state}" if state else city
     query      = f"{keyword} {localidade}"
@@ -596,6 +601,27 @@ async def scrape_leads(
         counter_lock  = asyncio.Lock()
 
         async def _extract_one(place_url: str) -> None:
+            # ── Cache lookup ──────────────────────────────────────────────
+            if place_cache is not None:
+                cached = await place_cache.get(place_url)
+                if cached is not None:
+                    detail = dict(cached)
+                    # Cached entries already had _city_confirmed stripped
+                    city_ok = _city_matches(detail.get("city", ""), city)
+                    if not city_ok:
+                        return
+                    async with counter_lock:
+                        leads.append(detail)
+                        found_counter["n"] += 1
+                        n = found_counter["n"]
+                    if progress_cb:
+                        try:
+                            await progress_cb(n, detail)
+                        except Exception as cb_exc:
+                            logger.debug("progress_cb error: %s", cb_exc)
+                    return  # served from cache — no Playwright needed
+
+            # ── Live extraction ───────────────────────────────────────────
             detail = await _extract_place(place_url, keyword, city, state, country, pool)
             if detail is None:
                 return
@@ -615,6 +641,11 @@ async def scrape_leads(
                     detail.get("name", ""), detail.get("address", ""),
                 )
                 return
+
+            # Store in place cache for future searches
+            if place_cache is not None:
+                await place_cache.set(place_url, detail)
+
             async with counter_lock:
                 leads.append(detail)
                 found_counter["n"] += 1
