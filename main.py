@@ -379,12 +379,19 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
 
         metrics.lead_scraped()
 
+        # DEBUG: log first 3 leads to diagnose dedup issue
+        if metrics.leads_scraped <= 3:
+            logger.info(
+                "job=%s lead_extracted n=%d name=%r city=%r phone=%r",
+                job_id, n, lead_dict.get("name"), lead_dict.get("city"), lead_dict.get("phone"),
+            )
+
         # ── Local dedup ───────────────────────────────────────────────────────
         if dedup.check_and_register(lead_dict):
             metrics.lead_deduped()
-            logger.debug(
-                "job=%s dedup_skip name=%r city=%r",
-                job_id, lead_dict.get("name"), lead_dict.get("city"),
+            logger.info(
+                "job=%s dedup_skip n=%d name=%r city=%r phone=%r",
+                job_id, n, lead_dict.get("name"), lead_dict.get("city"), lead_dict.get("phone"),
             )
             return
 
