@@ -369,12 +369,21 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         )
 
         # Announce "saving" to the UI before the HTTP request
+        logger.info("job=%s BEFORE _send_progress", job_id)
         await _send_progress(
             len(leads_sent if False else 0) or leads_sent,
             _stage_msg(leads_sent, max_results, phase="saving"),
         )
+        logger.info("job=%s AFTER _send_progress", job_id)
 
-        sent, new_c = await _flush_batch(session, job_id, to_send, metrics)
+        logger.info("job=%s BEFORE _flush_batch", job_id)
+        try:
+            sent, new_c = await _flush_batch(session, job_id, to_send, metrics)
+        except Exception as flush_exc:
+            logger.error("job=%s _flush_batch EXCEPTION: %s", job_id, flush_exc, exc_info=True)
+            sent, new_c = 0, 0
+        logger.info("job=%s AFTER _flush_batch", job_id)
+        
         leads_sent += sent
         new_leads  += new_c
         
