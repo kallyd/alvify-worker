@@ -368,13 +368,8 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             job_id, len(to_send),
         )
 
-        # Announce "saving" to the UI before the HTTP request
-        logger.info("job=%s BEFORE _send_progress", job_id)
-        await _send_progress(
-            len(leads_sent if False else 0) or leads_sent,
-            _stage_msg(leads_sent, max_results, phase="saving"),
-        )
-        logger.info("job=%s AFTER _send_progress", job_id)
+        # Fire-and-forget progress (non-blocking)
+        _send_progress(len(leads_sent if False else 0) or leads_sent, _stage_msg(leads_sent, max_results, phase="saving"))
 
         logger.info("job=%s BEFORE _flush_batch", job_id)
         try:
@@ -382,7 +377,7 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         except Exception as flush_exc:
             logger.error("job=%s _flush_batch EXCEPTION: %s", job_id, flush_exc, exc_info=True)
             sent, new_c = 0, 0
-        logger.info("job=%s AFTER _flush_batch", job_id)
+        logger.info("job=%s AFTER _flush_batch sent=%d new=%d", job_id, sent, new_c)
         
         leads_sent += sent
         new_leads  += new_c
@@ -393,18 +388,20 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         )
 
     async def _send_progress(n: int, msg: str) -> None:
-        """Fire-and-forget progress update to the API."""
+        """Truly fire-and-forget — never blocks the flush path."""
         pct = min(99, int(n / max_results * 100)) if max_results > 0 else 0
-        try:
-            async with session.post(
-                f"{API_URL}/internal/workers/jobs/{job_id}/progress",
-                headers=_worker_headers(),
-                json={"pct": pct, "n": n, "msg": msg},
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as _:
+        async def _do():
+            try:
+                async with session.post(
+                    f"{API_URL}/internal/workers/jobs/{job_id}/progress",
+                    headers=_worker_headers(),
+                    json={"pct": pct, "n": n, "msg": msg},
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as _:
+                    pass
+            except Exception:
                 pass
-        except Exception:
-            pass
+        asyncio.create_task(_do())
 
     async def _progress_cb(n: int, lead_dict: dict) -> None:
         """
@@ -445,9 +442,9 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         # Flush if we hit the batch size limit or the timeout
         await _maybe_flush()
 
-        # Progress message
+        # Progress message (fire-and-forget)
         msg = _stage_msg(n, max_results, phase="extracting", name=lead_dict.get("name", ""))
-        await _send_progress(n, msg)
+        _send_progress(n, msg)
 
     try:
         from core.scraper import scrape_leads
