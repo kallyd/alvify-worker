@@ -368,8 +368,8 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             job_id, len(to_send),
         )
 
-        # Fire-and-forget progress (non-blocking)
-        _send_progress(len(leads_sent if False else 0) or leads_sent, _stage_msg(leads_sent, max_results, phase="saving"))
+        # Fire-and-forget progress (non-blocking, returns immediately)
+        await _send_progress(leads_sent, _stage_msg(leads_sent, max_results, phase="saving"))
 
         logger.info("job=%s BEFORE _flush_batch", job_id)
         try:
@@ -442,9 +442,8 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         # Flush if we hit the batch size limit or the timeout
         await _maybe_flush()
 
-        # Progress message (fire-and-forget)
-        msg = _stage_msg(n, max_results, phase="extracting", name=lead_dict.get("name", ""))
-        _send_progress(n, msg)
+        # Progress message (fire-and-forget, returns immediately)
+        await _send_progress(n, _stage_msg(n, max_results, phase="extracting", name=lead_dict.get("name", "")))
 
     try:
         from core.scraper import scrape_leads
