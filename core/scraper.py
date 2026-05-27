@@ -658,6 +658,7 @@ async def scrape_leads(
 
         tasks = [asyncio.create_task(_extract_one(pu)) for pu in place_urls]
         await asyncio.gather(*tasks, return_exceptions=True)
+    else:
         # Sequential fallback (no pool)
         for place_url in place_urls:
             if len(leads) >= max_results:
