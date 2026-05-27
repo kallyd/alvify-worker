@@ -147,26 +147,40 @@ case "$HTTP_CODE" in
 esac
 
 echo ""
+# Detect Cloudflare proxy blocking (error 1010 = bot fingerprint ban)
+_is_cloudflare_block() {
+  echo "$RESP_BODY" | grep -qi "cloudflare\|error code: 1010\|1010"
+}
+
 if [[ "$TEST_RESULT" == OK:* ]]; then
   SUCCESS_CODE="${TEST_RESULT#OK:}"
   echo -e "${GREEN}${BOLD}  ✔ Conexão bem-sucedida! (HTTP ${SUCCESS_CODE})${RESET}"
   echo -e "  Worker autenticado com a API Alvify."
   CONN_OK=true
-elif [[ "$TEST_RESULT" == ERR:401:* || "$TEST_RESULT" == ERR:403:* ]]; then
-  CODE="${TEST_RESULT%%:*:*}"; CODE="${TEST_RESULT#ERR:}"; CODE="${CODE%%:*}"
-  echo -e "${RED}${BOLD}  ✘ Autenticação falhou (HTTP ${CODE})${RESET}"
-  echo -e "  Verifique se o Worker ID e a API Key estão corretos."
-  echo -e "  ${DIM}Resposta: ${TEST_RESULT}${RESET}"
+elif [[ "$TEST_RESULT" == ERR:401:* ]]; then
+  echo -e "${RED}${BOLD}  ✘ Autenticação falhou (HTTP 401)${RESET}"
+  echo -e "  A API Key está incorreta ou foi revogada."
   CONN_OK=false
 elif [[ "$TEST_RESULT" == ERR:404:* ]]; then
   echo -e "${RED}${BOLD}  ✘ Worker não encontrado (HTTP 404)${RESET}"
   echo -e "  Verifique se o Worker ID corresponde ao worker criado no painel."
   CONN_OK=false
+elif [[ "$TEST_RESULT" == ERR:403:* ]] && _is_cloudflare_block; then
+  echo -e "${YELLOW}${BOLD}  ⚠ Teste bloqueado pelo proxy Cloudflare (erro 1010)${RESET}"
+  echo -e "  Não foi possível verificar as credenciais automaticamente."
+  echo -e "  O serviço será iniciado assim mesmo — se a API Key estiver errada"
+  echo -e "  os logs mostrarão erro de autenticação (journalctl -u ${SERVICE_NAME} -f)."
+  CONN_OK=true   # proceed — service will log auth errors on its own if key is wrong
+elif [[ "$TEST_RESULT" == ERR:403:* ]]; then
+  echo -e "${RED}${BOLD}  ✘ Acesso negado (HTTP 403)${RESET}"
+  echo -e "  Verifique se o Worker ID e a API Key estão corretos."
+  echo -e "  ${DIM}Resposta: ${RESP_BODY:0:120}${RESET}"
+  CONN_OK=false
 else
   echo -e "${YELLOW}${BOLD}  ⚠ Não foi possível conectar à API${RESET}"
-  echo -e "  Verifique se ${API_URL} está acessível a partir desta máquina."
+  echo -e "  O serviço será iniciado assim mesmo — verifique os logs se houver problemas."
   echo -e "  ${DIM}Detalhe: ${TEST_RESULT}${RESET}"
-  CONN_OK=false
+  CONN_OK=true   # network issues should not block installation
 fi
 
 echo ""
