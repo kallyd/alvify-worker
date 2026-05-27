@@ -1,0 +1,7 @@
+fastapi
+playwright
+aiohttp
+psutil
+sqlalchemy[asyncio]
+asyncpg
+python-dotenv
