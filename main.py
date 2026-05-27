@@ -60,6 +60,7 @@ def _worker_headers() -> dict[str, str]:
         "Authorization": f"Bearer {WORKER_API_KEY}",
         "X-Worker-ID": WORKER_ID,
         "Content-Type": "application/json",
+        "User-Agent": f"alvify-worker/{VERSION}",
     }
 
 

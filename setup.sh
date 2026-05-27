@@ -128,34 +128,23 @@ success "Credenciais salvas"
 echo ""
 info "Testando conexão com ${API_URL}…"
 
-# Use the venv python to test the real API handshake
-TEST_RESULT=$("${VENV}/bin/python" - <<PYEOF 2>&1
-import urllib.request, json, sys, os
-api_url  = "${API_URL}".rstrip("/")
-worker_id = "${NEW_WORKER_ID}"
-api_key   = "${NEW_API_KEY}"
+# curl bypasses Cloudflare UA checks that block Python urllib
+HTTP_CODE=$(curl -s -o /tmp/_alvify_test.json -w "%{http_code}" \
+  --max-time 10 \
+  -X POST "${API_URL}/internal/workers/heartbeat" \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer ${NEW_API_KEY}" \
+  -H "X-Worker-ID: ${NEW_WORKER_ID}" \
+  -H "User-Agent: alvify-worker/1.0" \
+  -d '{"cpu_usage":0,"ram_usage":0,"active_jobs":0,"version":"setup"}' 2>/dev/null || echo "000")
+RESP_BODY=$(cat /tmp/_alvify_test.json 2>/dev/null || echo "")
 
-req = urllib.request.Request(
-    f"{api_url}/internal/workers/heartbeat",
-    data=json.dumps({"cpu_usage": 0.0, "ram_usage": 0.0, "active_jobs": 0, "version": "setup"}).encode(),
-    headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-        "X-Worker-ID": worker_id,
-    },
-    method="POST",
-)
-try:
-    with urllib.request.urlopen(req, timeout=10) as resp:
-        body = json.loads(resp.read())
-        print(f"OK:{resp.status}")
-except urllib.error.HTTPError as e:
-    body = e.read().decode()
-    print(f"ERR:{e.code}:{body[:200]}")
-except Exception as ex:
-    print(f"FAIL:{ex}")
-PYEOF
-)
+TEST_RESULT=""
+case "$HTTP_CODE" in
+  200|204) TEST_RESULT="OK:${HTTP_CODE}" ;;
+  000)     TEST_RESULT="FAIL:Não foi possível conectar (timeout ou DNS)" ;;
+  *)       TEST_RESULT="ERR:${HTTP_CODE}:${RESP_BODY:0:200}" ;;
+esac
 
 echo ""
 if [[ "$TEST_RESULT" == OK:* ]]; then
