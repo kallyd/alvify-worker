@@ -57,7 +57,6 @@ _LAUNCH_ARGS = [
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--disable-blink-features=AutomationControlled",
-    "--single-process",
 ]
 
 _USER_AGENTS = [
@@ -246,19 +245,26 @@ async def _extrair_detalhe(
             except ValueError:
                 pass
 
-    # Review count — read aria-label directly to avoid matching "Destaques" counts
+    # Review count — read aria-label directly.
+    # Selectors match both PT ("avaliação"/"avaliações") and EN ("review"/"reviews").
     review_count = 0
     _review_btn_sels = [
-        'button[aria-label*="valiações"]',
-        'button[aria-label*="eviews"]',
-        'a[aria-label*="valiações"]',
+        'button[aria-label*="avalia"]',   # PT: avaliação / avaliações
+        'button[aria-label*="eview"]',    # EN: review / reviews
+        'a[aria-label*="avalia"]',
+        'a[aria-label*="eview"]',
     ]
     for _sel in _review_btn_sels:
         try:
             _el = page.locator(_sel).first
             _label = await _el.get_attribute("aria-label", timeout=2000)
             if _label:
-                _m = re.search(r"([\d.,]+)", _label)
+                # Anchor to the count word so we don't pick up the rating ("4,5").
+                # PT: "1.250 avaliações" — EN: "1,250 reviews"
+                _m = (
+                    re.search(r"([\d.]+)\s*avaliaç", _label.lower()) or
+                    re.search(r"([\d,]+)\s*review",  _label.lower())
+                )
                 if _m:
                     _cleaned = re.sub(r"[^\d]", "", _m.group(1))
                     if _cleaned.isdigit():
@@ -266,15 +272,20 @@ async def _extrair_detalhe(
                         break
         except Exception:
             continue
-    # Fallback: span inside F7nice (total-count position, not highlights)
+    # Fallback: iterate aria-hidden spans inside div.F7nice.
+    # Rating span contains a comma ("4,5"); count span never does ("1.250" / "250").
     if review_count == 0:
         try:
-            _el = page.locator('div.F7nice').locator('span.UY7F9').first
-            _txt = await _el.text_content(timeout=1500)
-            if _txt:
+            _spans = page.locator('div.F7nice span[aria-hidden="true"]')
+            _n = await _spans.count()
+            for _i in range(_n):
+                _txt = (await _spans.nth(_i).text_content(timeout=800) or "").strip()
+                if not _txt or "," in _txt:   # skip empty or decimal (rating)
+                    continue
                 _cleaned = re.sub(r"[^\d]", "", _txt)
-                if _cleaned.isdigit():
+                if _cleaned.isdigit() and int(_cleaned) > 0:
                     review_count = int(_cleaned)
+                    break
         except Exception:
             pass
 
@@ -317,6 +328,10 @@ async def _extrair_detalhe(
     # City / state from address (store real location, not just the search param)
     parsed_city  = city
     parsed_state = state or ("SP" if country == "BR" else "")
+    # _city_confirmed: True when we verified the city from the address (or no address exists).
+    # False means the address contains text but we couldn't confirm the target city — the
+    # caller should treat these leads with extra scepticism.
+    _city_confirmed: bool = not bool(endereco)  # True when there is no address at all
     neighborhood: Optional[str] = None
     if endereco and country == "BR":
         addr_matches = re.findall(
@@ -330,6 +345,12 @@ async def _extrair_detalhe(
         ]
         if valid:
             parsed_city, parsed_state = valid[-1]
+            _city_confirmed = True
+        else:
+            # Regex didn't find a "City - ST" pattern; fall back to checking whether
+            # the target city name appears anywhere in the raw address text.
+            _addr_norm = unicodedata.normalize("NFD", endereco).encode("ascii", "ignore").decode().lower()
+            _city_confirmed = bool(_addr_norm) and _norm_city(city) in _addr_norm
         m = re.search(r"-\s*([^,\-]+)(?:,|\s*-)", endereco)
         if m:
             neighborhood = m.group(1).strip()
@@ -395,6 +416,9 @@ async def _extrair_detalhe(
         photo_url=photo_url,
         status="new",
         source="google_maps",
+        # Internal flag consumed by scrape_leads() — not persisted to the DB.
+        # True when the city was verified from the address (or no address exists).
+        _city_confirmed=_city_confirmed,
     )
 
 
@@ -575,10 +599,20 @@ async def scrape_leads(
             detail = await _extract_place(place_url, keyword, city, state, country, pool)
             if detail is None:
                 return
+            # Strip internal flag before any downstream use
+            city_confirmed = detail.pop("_city_confirmed", True)
             if not _city_matches(detail.get("city", ""), city):
                 logger.debug(
                     "Scraper: skipping '%s' — city '%s' ≠ target '%s'",
                     detail.get("name", ""), detail.get("city", ""), city,
+                )
+                return
+            # If the address didn't confirm the target city, drop the lead
+            # (address mentions a place but the target city name is absent).
+            if not city_confirmed:
+                logger.debug(
+                    "Scraper: skipping '%s' — city not confirmed in address '%s'",
+                    detail.get("name", ""), detail.get("address", ""),
                 )
                 return
             async with counter_lock:
@@ -593,24 +627,33 @@ async def scrape_leads(
 
         tasks = [asyncio.create_task(_extract_one(pu)) for pu in place_urls]
         await asyncio.gather(*tasks, return_exceptions=True)
-    else:
         # Sequential fallback (no pool)
         for place_url in place_urls:
             if len(leads) >= max_results:
                 break
             detail = await _extract_place(place_url, keyword, city, state, country, pool=None)
-            if detail and _city_matches(detail.get("city", ""), city):
-                leads.append(detail)
-                if progress_cb:
-                    try:
-                        await progress_cb(len(leads), detail)
-                    except Exception as cb_exc:
-                        logger.debug("progress_cb error: %s", cb_exc)
-            elif detail:
+            if detail is None:
+                continue
+            city_confirmed = detail.pop("_city_confirmed", True)
+            city_ok = _city_matches(detail.get("city", ""), city)
+            if not city_ok:
                 logger.debug(
                     "Scraper: skipping '%s' — city '%s' ≠ target '%s'",
                     detail.get("name", ""), detail.get("city", ""), city,
                 )
+                continue
+            if not city_confirmed:
+                logger.debug(
+                    "Scraper: skipping '%s' — city not confirmed in address '%s'",
+                    detail.get("name", ""), detail.get("address", ""),
+                )
+                continue
+            leads.append(detail)
+            if progress_cb:
+                try:
+                    await progress_cb(len(leads), detail)
+                except Exception as cb_exc:
+                    logger.debug("progress_cb error: %s", cb_exc)
 
     logger.info("Scraper finished: %d leads for '%s' in %s", len(leads), keyword, city)
     return leads
