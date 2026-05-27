@@ -185,47 +185,18 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             except Exception:
                 pass
 
-        # ── Run scraper ────────────────────────────────────────────────────
-        # scrape_leads is a sync generator; wrap in executor
-        import functools
-
-        loop = asyncio.get_event_loop()
-        collected: list[dict] = []
-
-        def _sync_scrape() -> list[dict]:
-            import asyncio as _aio
-
-            async def _inner():
-                results = []
-                async for lead in scrape_leads(
-                    keyword=keyword,
-                    city=city,
-                    state=state,
-                    max_results=max_results,
-                    country=country,
-                ):
-                    results.append(lead)
-                return results
-
-            return _aio.run(_inner())
-
-        # Run scrape_leads using its async generator interface directly
-        n = 0
-
-        async def _run_and_report():
-            nonlocal n
-            async for lead in scrape_leads(
-                keyword=keyword,
-                city=city,
-                state=state,
-                max_results=max_results,
-                country=country,
-                pool=browser_pool,
-            ):
-                n += 1
-                await _progress_cb(n, lead)
-
-        await _run_and_report()
+        # ── Run scraper ───────────────────────────────────────────────────
+        # scrape_leads is a regular async function that fires progress_cb
+        # for each lead as it is extracted, then returns the full list.
+        await scrape_leads(
+            keyword=keyword,
+            city=city,
+            state=state,
+            max_results=max_results,
+            country=country,
+            pool=browser_pool,
+            progress_cb=_progress_cb,
+        )
 
         # ── Mark complete ──────────────────────────────────────────────────
         async with session.post(
