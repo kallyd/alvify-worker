@@ -38,7 +38,6 @@ _LAUNCH_ARGS = [
     "--disable-dev-shm-usage",
     "--disable-gpu",
     "--disable-blink-features=AutomationControlled",
-    "--single-process",
 ]
 
 _USER_AGENTS = [
