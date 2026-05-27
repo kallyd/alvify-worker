@@ -222,16 +222,29 @@ async def _flush_batch(
     if not batch:
         return 0, 0
 
+    logger.info(
+        "job=%s _flush_batch called with %d leads",
+        job_id, len(batch),
+    )
+
     t0 = time.monotonic()
 
     # ── Try batch endpoint first ──────────────────────────────────────────────
     try:
+        logger.info(
+            "job=%s trying batch endpoint: %s",
+            job_id, BATCH_URL.format(job_id=job_id),
+        )
         async with session.post(
             BATCH_URL.format(job_id=job_id),
             headers=_worker_headers(),
             json=batch,
             timeout=aiohttp.ClientTimeout(total=60),
         ) as resp:
+            logger.info(
+                "job=%s batch endpoint response: status=%d",
+                job_id, resp.status,
+            )
             if resp.status == 200:
                 data = await resp.json()
                 sent     = data.get("count", 0)
@@ -335,12 +348,25 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             or len(_batch) >= BATCH_SIZE
             or (len(_batch) > 0 and time.monotonic() - _last_flush_ts >= BATCH_TIMEOUT)
         )
+        
+        # DEBUG: log flush decisions
+        if len(_batch) > 0:
+            logger.info(
+                "job=%s _maybe_flush called: batch_size=%d force=%s should_flush=%s",
+                job_id, len(_batch), force, should_flush,
+            )
+        
         if not should_flush or not _batch:
             return
 
         to_send = _batch[:]
         _batch.clear()
         _last_flush_ts = time.monotonic()
+
+        logger.info(
+            "job=%s flushing batch of %d leads",
+            job_id, len(to_send),
+        )
 
         # Announce "saving" to the UI before the HTTP request
         await _send_progress(
@@ -351,6 +377,11 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         sent, new_c = await _flush_batch(session, job_id, to_send, metrics)
         leads_sent += sent
         new_leads  += new_c
+        
+        logger.info(
+            "job=%s batch flushed: sent=%d new=%d",
+            job_id, sent, new_c,
+        )
 
     async def _send_progress(n: int, msg: str) -> None:
         """Fire-and-forget progress update to the API."""
@@ -396,6 +427,11 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             return
 
         _batch.append(lead_dict)
+        
+        logger.info(
+            "job=%s lead_added_to_batch n=%d batch_size=%d name=%r",
+            job_id, n, len(_batch), lead_dict.get("name"),
+        )
 
         # Flush if we hit the batch size limit or the timeout
         await _maybe_flush()
@@ -432,6 +468,11 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         await scrape_leads(**scrape_kwargs)
 
         # ── Final flush of any remaining buffered leads ───────────────────────
+        logger.info(
+            "job=%s scraping complete, final batch size=%d",
+            job_id, len(_batch),
+        )
+        
         if _batch:
             await _maybe_flush(force=True)
 
