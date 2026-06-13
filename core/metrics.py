@@ -54,6 +54,20 @@ class JobMetrics:
     batches_sent: int = 0
     total_batch_ms: int = 0
 
+    # Enrichment stats
+    leads_enriched: int = 0          # leads that had a website and were enriched
+    emails_found: int = 0
+    socials_found: int = 0
+    technologies_found: int = 0
+    enrich_cache_hits: int = 0
+    enrich_cache_misses: int = 0
+    total_enrich_ms: int = 0
+
+    # Phase timing
+    phase1_ms: int = 0               # time spent scrolling the feed
+    phase2_ms: int = 0               # time spent extracting place details
+    nav_times_ms: list = field(default_factory=list, repr=False)  # per-place navigation times
+
     def start(self) -> None:
         """Reset timing. Call once at job start."""
         self._start_ts = time.monotonic()
@@ -86,6 +100,33 @@ class JobMetrics:
         self.batches_sent += 1
         self.total_batch_ms += elapsed_ms
 
+    def lead_enriched(
+        self,
+        emails: int = 0,
+        socials: int = 0,
+        technologies: int = 0,
+        elapsed_ms: int = 0,
+        cache_hit: bool = False,
+    ) -> None:
+        self.leads_enriched += 1
+        self.emails_found += emails
+        self.socials_found += socials
+        self.technologies_found += technologies
+        self.total_enrich_ms += elapsed_ms
+        if cache_hit:
+            self.enrich_cache_hits += 1
+        else:
+            self.enrich_cache_misses += 1
+
+    def record_phase1(self, elapsed_ms: int) -> None:
+        self.phase1_ms = elapsed_ms
+
+    def record_phase2(self, elapsed_ms: int) -> None:
+        self.phase2_ms = elapsed_ms
+
+    def record_nav(self, elapsed_ms: int) -> None:
+        self.nav_times_ms.append(elapsed_ms)
+
     # ── Computed properties ───────────────────────────────────────────────────
 
     @property
@@ -105,6 +146,10 @@ class JobMetrics:
     @property
     def avg_batch_ms(self) -> float:
         return (self.total_batch_ms / self.batches_sent) if self.batches_sent > 0 else 0.0
+
+    @property
+    def avg_nav_ms(self) -> float:
+        return (sum(self.nav_times_ms) / len(self.nav_times_ms)) if self.nav_times_ms else 0.0
 
     # ── Reporting ─────────────────────────────────────────────────────────────
 
@@ -128,12 +173,18 @@ class JobMetrics:
             "cache_hits=%d cache_hit_rate=%.0f%% "
             "errors=%d retries=%d "
             "batches=%d avg_batch_ms=%.0f "
+            "phase1_ms=%d phase2_ms=%d avg_nav_ms=%.0f navs=%d "
+            "enriched=%d emails=%d socials=%d technologies=%d "
+            "enrich_cache_hits=%d enrich_cache_misses=%d "
             "elapsed=%.1fs leads_per_min=%.1f instant_lpm=%.1f",
             label, self.job_id,
             self.leads_scraped, self.leads_sent, self.leads_new, self.leads_deduped,
             self.cache_hits, self.cache_hit_rate * 100,
             self.errors, self.retries,
             self.batches_sent, self.avg_batch_ms,
+            self.phase1_ms, self.phase2_ms, self.avg_nav_ms, len(self.nav_times_ms),
+            self.leads_enriched, self.emails_found, self.socials_found, self.technologies_found,
+            self.enrich_cache_hits, self.enrich_cache_misses,
             self.elapsed_s, self.leads_per_min, instant_lpm,
         )
 
@@ -149,4 +200,16 @@ class JobMetrics:
             "errors": self.errors,
             "elapsed_s": round(self.elapsed_s, 1),
             "leads_per_min": round(self.leads_per_min, 1),
+            # phase timing
+            "phase1_ms": self.phase1_ms,
+            "phase2_ms": self.phase2_ms,
+            "avg_nav_ms": round(self.avg_nav_ms, 0),
+            "cache_hit_rate": round(self.cache_hit_rate * 100, 1),
+            # enrichment
+            "leads_enriched": self.leads_enriched,
+            "emails_found": self.emails_found,
+            "socials_found": self.socials_found,
+            "technologies_found": self.technologies_found,
+            "enrich_cache_hits": self.enrich_cache_hits,
+            "enrich_cache_misses": self.enrich_cache_misses,
         }

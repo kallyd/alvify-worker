@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -53,7 +54,7 @@ logger = logging.getLogger(__name__)
 
 # ── Tunable constants ─────────────────────────────────────────────────────────
 
-_MAX_SLOTS: int = 4        # simultaneous page slots (≈ _MAX_CONTEXTS previously)
+_MAX_SLOTS: int = int(os.environ.get("MAX_BROWSER_SLOTS", "4"))
 _SLOT_MAX_USES: int = 40   # recycle a slot's context after this many navigations
 _BROWSER_MAX_USES: int = 160  # restart Chromium after this many total slot uses
 _RESET_TIMEOUT_MS: int = 4_000  # max ms for about:blank reset navigation
@@ -224,6 +225,17 @@ class BrowserPool:
         )
         await ctx.add_init_script(_INIT_SCRIPT)
         page = await ctx.new_page()
+
+        _BLOCKED_TYPES = {"image", "media", "font"}
+
+        async def _block_heavy(route):
+            if route.request.resource_type in _BLOCKED_TYPES:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", _block_heavy)
+
         self._browser_uses += 1
         return _Slot(ctx=ctx, page=page, uses=0, slot_id=slot_id)
 

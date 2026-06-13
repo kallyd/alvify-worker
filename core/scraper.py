@@ -1,12 +1,13 @@
 """
-Google Maps business scraper using Playwright (v2 — two-phase parallel).
+Google Maps business scraper using Playwright (v3 — pipelined parallel).
 
-Phase 1 — Feed scroll (1 pool page):
-  Open search URL, scroll the results feed, collect all place URLs (fast).
+Phase 1 (producer) — Feed scroll (1 pool page):
+  Open search URL, scroll the results feed, push place URLs into an
+  asyncio.Queue as they are discovered.
 
-Phase 2 — Parallel detail extraction (pool pages):
-  Navigate to each place URL directly in an isolated context.
-  BrowserPool.semaphore limits concurrency; asyncio.gather runs all tasks.
+Phase 2 (consumers) — Parallel detail extraction (N pool pages):
+  Worker coroutines pull URLs from the queue and extract details
+  concurrently, overlapping with phase-1 scrolling.
   Each extracted lead triggers progress_cb(n, lead_dict) immediately so the
   caller (worker.py) can persist + stream it to Redis without waiting for
   the full batch.
@@ -19,6 +20,7 @@ import asyncio
 import logging
 import random as _random
 import re
+import time
 import unicodedata
 from typing import Callable, Awaitable, Optional
 from urllib.parse import quote_plus
@@ -429,16 +431,29 @@ async def _collect_place_urls(
     search_url: str,
     max_results: int,
     pool=None,
-) -> list[str]:
-    """Scroll the Maps search feed and return up to max_results place URLs."""
+) -> list[dict]:
+    """Scroll the Maps search feed and return up to max_results place dicts.
+
+    Each dict has: url, name, rating, reviews, category (from feed cards).
+    """
 
     async def _run(page) -> list[str]:
         logger.info("Scraper phase-1: loading feed for '%s'", query)
-        await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(3)
 
-        if await _detectar_captcha(page):
-            logger.warning("Scraper phase-1: captcha detected — aborting")
+        for attempt in range(_RETRY_ATTEMPTS):
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+
+            if not await _detectar_captcha(page):
+                break
+            if attempt < _RETRY_ATTEMPTS - 1:
+                wait = 5 * (attempt + 1)
+                logger.warning(
+                    "Scraper phase-1: captcha detected (attempt %d/%d) — retrying in %ds",
+                    attempt + 1, _RETRY_ATTEMPTS, wait,
+                )
+                await asyncio.sleep(wait)
+        else:
+            logger.warning("Scraper phase-1: captcha persists after %d attempts — aborting", _RETRY_ATTEMPTS)
             return []
 
         await _aceitar_cookies(page)
@@ -469,17 +484,34 @@ async def _collect_place_urls(
 
         links_loc = page.locator(f'{feed_sel} a[href*="/maps/place/"]')
         total = min(await links_loc.count(), max_results)
-        hrefs: list[str] = []
+        results: list[dict] = []
         for i in range(total):
             try:
-                href = await links_loc.nth(i).get_attribute("href")
-                if href and "/maps/place/" in href:
-                    hrefs.append(href)
+                el = links_loc.nth(i)
+                href = await el.get_attribute("href")
+                if not href or "/maps/place/" not in href:
+                    continue
+                card = await el.evaluate("""el => {
+                    const container = el.closest('[jsaction]') || el.parentElement;
+                    if (!container) return {};
+                    const nameEl = container.querySelector('.fontHeadlineSmall, .qBF1Pd');
+                    const ratingEl = container.querySelector('.MW4etd');
+                    const reviewEl = container.querySelector('.UY7F9');
+                    const catEl = container.querySelector('.W4Efsd:last-child .W4Efsd > span:nth-child(2) > span:first-child') ||
+                                  container.querySelector('[jsinstance] .W4Efsd > span > span');
+                    return {
+                        name: nameEl ? nameEl.textContent.trim() : '',
+                        rating: ratingEl ? ratingEl.textContent.trim() : '',
+                        reviews: reviewEl ? reviewEl.textContent.replace(/[^0-9]/g, '') : '',
+                        category: catEl ? catEl.textContent.trim().replace(/^·\\s*/, '') : ''
+                    };
+                }""")
+                results.append({"url": href, **(card or {})})
             except Exception:
                 pass
 
-        logger.info("Scraper phase-1: collected %d URLs for '%s'", len(hrefs), query)
-        return hrefs
+        logger.info("Scraper phase-1: collected %d places for '%s'", len(results), query)
+        return results
 
     if pool is not None and pool.is_started:
         async with pool.page() as page:
@@ -524,7 +556,6 @@ async def _extract_place(
                 )
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
             if await _detectar_captcha(page):
                 logger.warning("Scraper phase-2: captcha detected")
                 return None
@@ -565,120 +596,41 @@ async def scrape_leads(
     progress_cb: Optional[Callable[[int, dict], Awaitable[None]]] = None,
     pool=None,
     place_cache=None,  # Optional[PlaceCache] — per-URL extraction cache
+    metrics=None,      # Optional[JobMetrics] — phase timing instrumentation
 ) -> list[dict]:
     """
     Scrape Google Maps for businesses matching *keyword* in *city*.
 
-    Two-phase:
-      Phase 1 — scroll the Maps feed to collect place URLs.
-      Phase 2 — extract details for each URL in parallel (pool) or
-                sequentially (fallback).
+    Pipeline architecture:
+      Phase 1 (producer) — scrolls the Maps feed and pushes place URLs into
+        an asyncio.Queue as they are discovered.
+      Phase 2 (consumers) — N workers pull URLs from the queue and extract
+        details in parallel, overlapping with phase-1 scrolling.
 
-    progress_cb(n, lead_dict) fires after each lead is extracted so the
-    caller can persist and stream the lead immediately.
-
-    place_cache (optional): a PlaceCache instance; when provided, each
-    place URL is checked against the cache before Playwright extraction,
-    and results are stored in the cache after a successful extraction.
+    Fallback (no pool): sequential collection then extraction (v1 behaviour).
     """
     localidade = f"{city} {state}" if state else city
     query      = f"{keyword} {localidade}"
     url        = _MAPS_URL.format(query=quote_plus(query))
     leads: list[dict] = []
 
-    # Phase 1 ─────────────────────────────────────────────────────────────────
-    place_urls = await _collect_place_urls(query, url, max_results, pool)
-    if not place_urls:
-        logger.info("Scraper: no URLs collected for '%s'", query)
-        return leads
-
-    logger.info("Scraper: starting phase-2 for %d places", len(place_urls))
-
-    # Phase 2 ─────────────────────────────────────────────────────────────────
-    if pool is not None and pool.is_started:
-        # Parallel — BrowserPool semaphore limits concurrency automatically
-        found_counter = {"n": 0}
-        counter_lock  = asyncio.Lock()
-
-        async def _extract_one(place_url: str) -> None:
-            # ── Cache lookup ──────────────────────────────────────────────
-            if place_cache is not None:
-                cached = await place_cache.get(place_url)
-                if cached is not None:
-                    detail = dict(cached)
-                    # Cached entries already had _city_confirmed stripped
-                    city_ok = _city_matches(detail.get("city", ""), city)
-                    if not city_ok:
-                        return
-                    async with counter_lock:
-                        leads.append(detail)
-                        found_counter["n"] += 1
-                        n = found_counter["n"]
-                    if progress_cb:
-                        try:
-                            await progress_cb(n, detail)
-                        except Exception as cb_exc:
-                            logger.debug("progress_cb error: %s", cb_exc)
-                    return  # served from cache — no Playwright needed
-
-            # ── Live extraction ───────────────────────────────────────────
-            detail = await _extract_place(place_url, keyword, city, state, country, pool)
-            if detail is None:
-                return
-            # Strip internal flag before any downstream use
-            city_confirmed = detail.pop("_city_confirmed", True)
-            if not _city_matches(detail.get("city", ""), city):
-                logger.debug(
-                    "Scraper: skipping '%s' — city '%s' ≠ target '%s'",
-                    detail.get("name", ""), detail.get("city", ""), city,
-                )
-                return
-            # If the address didn't confirm the target city, drop the lead
-            # (address mentions a place but the target city name is absent).
-            if not city_confirmed:
-                logger.debug(
-                    "Scraper: skipping '%s' — city not confirmed in address '%s'",
-                    detail.get("name", ""), detail.get("address", ""),
-                )
-                return
-
-            # Store in place cache for future searches
-            if place_cache is not None:
-                await place_cache.set(place_url, detail)
-
-            async with counter_lock:
-                leads.append(detail)
-                found_counter["n"] += 1
-                n = found_counter["n"]
-            if progress_cb:
-                try:
-                    await progress_cb(n, detail)
-                except Exception as cb_exc:
-                    logger.debug("progress_cb error: %s", cb_exc)
-
-        tasks = [asyncio.create_task(_extract_one(pu)) for pu in place_urls]
-        await asyncio.gather(*tasks, return_exceptions=True)
-    else:
-        # Sequential fallback (no pool)
-        for place_url in place_urls:
+    # ── Sequential fallback (no pool) — unchanged logic ──────────────────────
+    if pool is None or not pool.is_started:
+        place_items = await _collect_place_urls(query, url, max_results, pool=None)
+        if not place_items:
+            logger.info("Scraper: no URLs collected for '%s'", query)
+            return leads
+        for item in place_items:
             if len(leads) >= max_results:
                 break
+            place_url = item["url"] if isinstance(item, dict) else item
             detail = await _extract_place(place_url, keyword, city, state, country, pool=None)
             if detail is None:
                 continue
             city_confirmed = detail.pop("_city_confirmed", True)
-            city_ok = _city_matches(detail.get("city", ""), city)
-            if not city_ok:
-                logger.debug(
-                    "Scraper: skipping '%s' — city '%s' ≠ target '%s'",
-                    detail.get("name", ""), detail.get("city", ""), city,
-                )
+            if not _city_matches(detail.get("city", ""), city):
                 continue
             if not city_confirmed:
-                logger.debug(
-                    "Scraper: skipping '%s' — city not confirmed in address '%s'",
-                    detail.get("name", ""), detail.get("address", ""),
-                )
                 continue
             leads.append(detail)
             if progress_cb:
@@ -686,6 +638,113 @@ async def scrape_leads(
                     await progress_cb(len(leads), detail)
                 except Exception as cb_exc:
                     logger.debug("progress_cb error: %s", cb_exc)
+        logger.info("Scraper finished: %d leads for '%s' in %s", len(leads), keyword, city)
+        return leads
+
+    # ── Pipeline mode (pool available) ───────────────────────────────────────
+    _SENTINEL = None
+    url_queue: asyncio.Queue = asyncio.Queue()
+    found_counter = {"n": 0}
+    counter_lock  = asyncio.Lock()
+
+    async def _producer():
+        """Phase 1: scroll feed and push place dicts into the queue."""
+        t0 = time.monotonic()
+        place_items = await _collect_place_urls(query, url, max_results, pool)
+        if metrics:
+            metrics.record_phase1(int((time.monotonic() - t0) * 1000))
+        for item in place_items:
+            await url_queue.put(item)
+        await url_queue.put(_SENTINEL)
+
+    async def _consumer():
+        """Phase 2 worker: pull place dicts from queue and extract."""
+        while True:
+            item = await url_queue.get()
+            if item is _SENTINEL:
+                await url_queue.put(_SENTINEL)
+                break
+            try:
+                await _process_one(item)
+            except Exception as exc:
+                pu = item.get("url", "?")[:60] if isinstance(item, dict) else str(item)[:60]
+                logger.debug("consumer error for %s: %s", pu, exc)
+            finally:
+                url_queue.task_done()
+
+    async def _process_one(item: dict):
+        place_url = item["url"]
+        feed_meta = {k: v for k, v in item.items() if k != "url" and v}
+
+        if place_cache is not None:
+            cached = await place_cache.get(place_url)
+            if cached is not None:
+                detail = dict(cached)
+                if not _city_matches(detail.get("city", ""), city):
+                    return
+                async with counter_lock:
+                    leads.append(detail)
+                    found_counter["n"] += 1
+                    n = found_counter["n"]
+                if metrics:
+                    metrics.cache_hit()
+                if progress_cb:
+                    try:
+                        await progress_cb(n, detail)
+                    except Exception as cb_exc:
+                        logger.debug("progress_cb error: %s", cb_exc)
+                return
+
+        t0 = time.monotonic()
+        detail = await _extract_place(place_url, keyword, city, state, country, pool)
+        if metrics:
+            metrics.record_nav(int((time.monotonic() - t0) * 1000))
+        if detail is None:
+            return
+        city_confirmed = detail.pop("_city_confirmed", True)
+        if not _city_matches(detail.get("city", ""), city):
+            return
+        if not city_confirmed:
+            return
+
+        # Backfill from feed card data when phase-2 missed a field
+        if feed_meta.get("name") and not detail.get("name"):
+            detail["name"] = feed_meta["name"]
+        if feed_meta.get("category") and detail.get("category") == keyword.title():
+            detail["category"] = feed_meta["category"]
+        if feed_meta.get("rating") and not detail.get("rating"):
+            try:
+                detail["rating"] = float(feed_meta["rating"].replace(",", "."))
+            except (ValueError, AttributeError):
+                pass
+        if feed_meta.get("reviews") and not detail.get("review_count"):
+            try:
+                detail["review_count"] = int(feed_meta["reviews"])
+            except (ValueError, TypeError):
+                pass
+
+        if place_cache is not None:
+            await place_cache.set(place_url, detail)
+
+        async with counter_lock:
+            leads.append(detail)
+            found_counter["n"] += 1
+            n = found_counter["n"]
+        if progress_cb:
+            try:
+                await progress_cb(n, detail)
+            except Exception as cb_exc:
+                logger.debug("progress_cb error: %s", cb_exc)
+
+    num_consumers = pool._max_slots
+    producer_task = asyncio.create_task(_producer())
+    consumer_tasks = [asyncio.create_task(_consumer()) for _ in range(num_consumers)]
+
+    t0_phase2 = time.monotonic()
+    await producer_task
+    await asyncio.gather(*consumer_tasks, return_exceptions=True)
+    if metrics:
+        metrics.record_phase2(int((time.monotonic() - t0_phase2) * 1000))
 
     logger.info("Scraper finished: %d leads for '%s' in %s", len(leads), keyword, city)
     return leads

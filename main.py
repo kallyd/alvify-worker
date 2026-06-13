@@ -61,7 +61,7 @@ import aiohttp
 API_URL:        str = os.environ.get("API_URL", "http://localhost:18080/api").rstrip("/")
 WORKER_ID:      str = os.environ.get("WORKER_ID", "")
 WORKER_API_KEY: str = os.environ.get("WORKER_API_KEY", "")
-MAX_CONCURRENCY: int = int(os.environ.get("MAX_CONCURRENCY", "2"))
+MAX_CONCURRENCY: int = int(os.environ.get("MAX_CONCURRENCY", "5"))  # tuned for 6-core VPS
 LOG_LEVEL:      str = os.environ.get("LOG_LEVEL", "INFO").upper()
 VERSION:        str = os.environ.get("VERSION", "1.0.0")
 REDIS_URL:      str = os.environ.get("REDIS_URL", "")
@@ -71,6 +71,10 @@ CACHE_REFRESH_QUEUE = "alvify:queue:cache_refresh"
 # Batch flush settings
 BATCH_SIZE:    int   = int(os.environ.get("BATCH_SIZE", "50"))
 BATCH_TIMEOUT: float = float(os.environ.get("BATCH_TIMEOUT", "3"))
+
+# Enrichment pipeline
+ENRICHMENT_ENABLED: bool  = os.environ.get("ENRICHMENT_ENABLED", "true").lower() not in ("0", "false", "no")
+ENRICHMENT_TIMEOUT: float = float(os.environ.get("ENRICHMENT_TIMEOUT", "15"))
 
 # API endpoints
 POLL_URL      = f"{API_URL}/internal/workers/jobs/poll"
@@ -351,7 +355,7 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         
         # DEBUG: log flush decisions
         if len(_batch) > 0:
-            logger.info(
+            logger.debug(
                 "job=%s _maybe_flush called: batch_size=%d force=%s should_flush=%s",
                 job_id, len(_batch), force, should_flush,
             )
@@ -371,13 +375,13 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         # Fire-and-forget progress (non-blocking, returns immediately)
         await _send_progress(leads_sent, _stage_msg(leads_sent, max_results, phase="saving"))
 
-        logger.info("job=%s BEFORE _flush_batch", job_id)
+        logger.debug("job=%s BEFORE _flush_batch", job_id)
         try:
             sent, new_c = await _flush_batch(session, job_id, to_send, metrics)
         except Exception as flush_exc:
             logger.error("job=%s _flush_batch EXCEPTION: %s", job_id, flush_exc, exc_info=True)
             sent, new_c = 0, 0
-        logger.info("job=%s AFTER _flush_batch sent=%d new=%d", job_id, sent, new_c)
+        logger.debug("job=%s AFTER _flush_batch sent=%d new=%d", job_id, sent, new_c)
         
         leads_sent += sent
         new_leads  += new_c
@@ -408,9 +412,10 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         Called by the scraper after each lead is extracted.
 
         1. Skip duplicates (local dedup)
-        2. Add to batch buffer
-        3. Flush if batch is full or timeout elapsed
-        4. Send progress update to API
+        2. Run enrichment pipeline (website, email, socials, technologies)
+        3. Add to batch buffer
+        4. Flush if batch is full or timeout elapsed
+        5. Send progress update to API
         """
         nonlocal leads_sent, new_leads
 
@@ -432,9 +437,22 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             )
             return
 
+        # ── Enrichment pipeline (best-effort, never blocks ingest) ────────────
+        if ENRICHMENT_ENABLED and lead_dict.get("website"):
+            try:
+                from core.enrichment import enrich_lead
+                await enrich_lead(lead_dict, session=session, timeout=ENRICHMENT_TIMEOUT)
+                metrics.lead_enriched(
+                    emails=len(lead_dict.get("emails") or []),
+                    socials=len(lead_dict.get("socials") or {}),
+                    technologies=len(lead_dict.get("technologies") or []),
+                )
+            except Exception as enrich_exc:
+                logger.debug("enrichment failed for %s: %s", lead_dict.get("website"), enrich_exc)
+
         _batch.append(lead_dict)
         
-        logger.info(
+        logger.debug(
             "job=%s lead_added_to_batch n=%d batch_size=%d name=%r",
             job_id, n, len(_batch), lead_dict.get("name"),
         )
@@ -466,6 +484,7 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             country=country,
             pool=browser_pool,
             progress_cb=_progress_cb,
+            metrics=metrics,
         )
         if _place_cache is not None:
             scrape_kwargs["place_cache"] = _place_cache
