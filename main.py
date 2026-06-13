@@ -62,6 +62,7 @@ API_URL:        str = os.environ.get("API_URL", "http://localhost:18080/api").rs
 WORKER_ID:      str = os.environ.get("WORKER_ID", "")
 WORKER_API_KEY: str = os.environ.get("WORKER_API_KEY", "")
 MAX_CONCURRENCY: int = int(os.environ.get("MAX_CONCURRENCY", "5"))  # tuned for 6-core VPS
+JOB_TIMEOUT:    int = int(os.environ.get("JOB_TIMEOUT", "300"))     # max seconds per job
 LOG_LEVEL:      str = os.environ.get("LOG_LEVEL", "INFO").upper()
 VERSION:        str = os.environ.get("VERSION", "1.0.0")
 REDIS_URL:      str = os.environ.get("REDIS_URL", "")
@@ -634,8 +635,32 @@ async def _poll_loop(session: aiohttp.ClientSession) -> None:
         await queue.ack(job.get("job_id", ""), session)
 
         async def _run(j=job):
+            job_id = j.get("job_id", "unknown")
             async with semaphore:
-                await _process_job(session, j)
+                try:
+                    await asyncio.wait_for(_process_job(session, j), timeout=JOB_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.error("job_timeout job=%s exceeded %ds — marking failed", job_id, JOB_TIMEOUT)
+                    try:
+                        await session.post(
+                            f"{API_URL}/internal/workers/jobs/{job_id}/error",
+                            headers=_worker_headers(),
+                            json={"error": f"Job timed out after {JOB_TIMEOUT}s"},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        )
+                    except Exception:
+                        pass
+                except Exception as exc:
+                    logger.error("job_crash job=%s error=%s", job_id, exc, exc_info=True)
+                    try:
+                        await session.post(
+                            f"{API_URL}/internal/workers/jobs/{job_id}/error",
+                            headers=_worker_headers(),
+                            json={"error": str(exc)[:500]},
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        )
+                    except Exception:
+                        pass
 
         asyncio.create_task(_run())
 
