@@ -81,6 +81,13 @@ class ApiPollQueueClient:
             ) as resp:
                 if resp.status == 204:
                     return None  # No job available before timeout
+                if resp.status in (502, 503, 504):
+                    # API is restarting or unavailable — backoff to avoid log spam
+                    logger.warning(
+                        "QueueClient poll returned HTTP %d — backing off 5s", resp.status
+                    )
+                    await asyncio.sleep(5)
+                    return None
                 if resp.status != 200:
                     logger.warning(
                         "QueueClient poll returned HTTP %d", resp.status
@@ -92,6 +99,11 @@ class ApiPollQueueClient:
                 return job
         except asyncio.TimeoutError:
             # Expected for long-poll: the server held the connection open.
+            return None
+        except (aiohttp.ClientConnectorError, ConnectionRefusedError, OSError):
+            # API is down — backoff
+            logger.warning("QueueClient poll connection failed — backing off 5s")
+            await asyncio.sleep(5)
             return None
         except Exception as exc:
             logger.warning("QueueClient poll error: %s", exc)
