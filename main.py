@@ -61,8 +61,7 @@ import aiohttp
 API_URL:        str = os.environ.get("API_URL", "http://localhost:18080/api").rstrip("/")
 WORKER_ID:      str = os.environ.get("WORKER_ID", "")
 WORKER_API_KEY: str = os.environ.get("WORKER_API_KEY", "")
-MAX_CONCURRENCY: int = int(os.environ.get("MAX_CONCURRENCY", "5"))  # tuned for 6-core VPS
-JOB_TIMEOUT:    int = int(os.environ.get("JOB_TIMEOUT", "300"))     # max seconds per job
+MAX_CONCURRENCY: int = int(os.environ.get("MAX_CONCURRENCY", "2"))
 LOG_LEVEL:      str = os.environ.get("LOG_LEVEL", "INFO").upper()
 VERSION:        str = os.environ.get("VERSION", "1.0.0")
 REDIS_URL:      str = os.environ.get("REDIS_URL", "")
@@ -72,10 +71,6 @@ CACHE_REFRESH_QUEUE = "alvify:queue:cache_refresh"
 # Batch flush settings
 BATCH_SIZE:    int   = int(os.environ.get("BATCH_SIZE", "50"))
 BATCH_TIMEOUT: float = float(os.environ.get("BATCH_TIMEOUT", "3"))
-
-# Enrichment pipeline
-ENRICHMENT_ENABLED: bool  = os.environ.get("ENRICHMENT_ENABLED", "true").lower() not in ("0", "false", "no")
-ENRICHMENT_TIMEOUT: float = float(os.environ.get("ENRICHMENT_TIMEOUT", "15"))
 
 # API endpoints
 POLL_URL      = f"{API_URL}/internal/workers/jobs/poll"
@@ -298,6 +293,40 @@ async def _flush_batch(
     return sent, new_c
 
 
+# ── Job status polling (pause/cancel) ────────────────────────────────────────
+
+
+class _JobCancelled(Exception):
+    """Raised when a job is cancelled by the user during processing."""
+    pass
+
+
+async def check_job_status(
+    session: aiohttp.ClientSession,
+    job_id: str,
+    api_base: str,
+    api_key: str,
+    worker_id: str,
+) -> str:
+    """Poll job status from API. Returns 'running', 'paused', or 'cancelled'.
+
+    On any error, returns 'running' (fail-open — don't stop a job due to
+    network issues).
+    """
+    try:
+        url = f"{api_base}/internal/workers/jobs/{job_id}/status"
+        headers = {"Authorization": f"Bearer {api_key}", "X-Worker-ID": worker_id}
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("status", "running")
+            return "running"
+    except Exception:
+        return "running"
+
+
 # ── Job processor ─────────────────────────────────────────────────────────────
 
 async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
@@ -356,7 +385,7 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         
         # DEBUG: log flush decisions
         if len(_batch) > 0:
-            logger.debug(
+            logger.info(
                 "job=%s _maybe_flush called: batch_size=%d force=%s should_flush=%s",
                 job_id, len(_batch), force, should_flush,
             )
@@ -376,21 +405,36 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         # Fire-and-forget progress (non-blocking, returns immediately)
         await _send_progress(leads_sent, _stage_msg(leads_sent, max_results, phase="saving"))
 
-        logger.debug("job=%s BEFORE _flush_batch", job_id)
+        logger.info("job=%s BEFORE _flush_batch", job_id)
         try:
             sent, new_c = await _flush_batch(session, job_id, to_send, metrics)
         except Exception as flush_exc:
             logger.error("job=%s _flush_batch EXCEPTION: %s", job_id, flush_exc, exc_info=True)
             sent, new_c = 0, 0
-        logger.debug("job=%s AFTER _flush_batch sent=%d new=%d", job_id, sent, new_c)
+        logger.info("job=%s AFTER _flush_batch sent=%d new=%d", job_id, sent, new_c)
         
         leads_sent += sent
         new_leads  += new_c
-        
+
         logger.info(
             "job=%s batch flushed: sent=%d new=%d",
             job_id, sent, new_c,
         )
+
+        # ── Pause/cancel check after each flush ──────────────────────────────
+        status = await check_job_status(session, job_id, API_URL, WORKER_API_KEY, WORKER_ID)
+        if status == "cancelled":
+            logger.info("job=%s cancelled by user, stopping", job_id)
+            raise _JobCancelled()
+        elif status == "paused":
+            logger.info("job=%s paused by user, waiting...", job_id)
+            while status == "paused":
+                await asyncio.sleep(5)
+                status = await check_job_status(session, job_id, API_URL, WORKER_API_KEY, WORKER_ID)
+            if status == "cancelled":
+                logger.info("job=%s cancelled while paused, stopping", job_id)
+                raise _JobCancelled()
+            logger.info("job=%s resumed, continuing", job_id)
 
     async def _send_progress(n: int, msg: str) -> None:
         """Truly fire-and-forget — never blocks the flush path."""
@@ -413,10 +457,9 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         Called by the scraper after each lead is extracted.
 
         1. Skip duplicates (local dedup)
-        2. Run enrichment pipeline (website, email, socials, technologies)
-        3. Add to batch buffer
-        4. Flush if batch is full or timeout elapsed
-        5. Send progress update to API
+        2. Add to batch buffer
+        3. Flush if batch is full or timeout elapsed
+        4. Send progress update to API
         """
         nonlocal leads_sent, new_leads
 
@@ -438,22 +481,9 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             )
             return
 
-        # ── Enrichment pipeline (best-effort, never blocks ingest) ────────────
-        if ENRICHMENT_ENABLED and lead_dict.get("website"):
-            try:
-                from core.enrichment import enrich_lead
-                await enrich_lead(lead_dict, session=session, timeout=ENRICHMENT_TIMEOUT)
-                metrics.lead_enriched(
-                    emails=len(lead_dict.get("emails") or []),
-                    socials=len(lead_dict.get("socials") or {}),
-                    technologies=len(lead_dict.get("technologies") or []),
-                )
-            except Exception as enrich_exc:
-                logger.debug("enrichment failed for %s: %s", lead_dict.get("website"), enrich_exc)
-
         _batch.append(lead_dict)
         
-        logger.debug(
+        logger.info(
             "job=%s lead_added_to_batch n=%d batch_size=%d name=%r",
             job_id, n, len(_batch), lead_dict.get("name"),
         )
@@ -485,12 +515,16 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             country=country,
             pool=browser_pool,
             progress_cb=_progress_cb,
-            metrics=metrics,
         )
         if _place_cache is not None:
             scrape_kwargs["place_cache"] = _place_cache
 
-        await scrape_leads(**scrape_kwargs)
+        # Timeout: 10 minutes max per job to prevent infinite hangs
+        _JOB_TIMEOUT = 600
+        try:
+            await asyncio.wait_for(scrape_leads(**scrape_kwargs), timeout=_JOB_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise TimeoutError(f"Busca excedeu o tempo limite de {_JOB_TIMEOUT // 60} minutos")
 
         # ── Final flush of any remaining buffered leads ───────────────────────
         logger.info(
@@ -518,6 +552,27 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         logger.info(
             "job_done job=%s leads_sent=%d new=%d deduped=%d elapsed=%.1fs",
             job_id, leads_sent, new_leads, dedup.seen_count - leads_sent, elapsed,
+        )
+
+    except _JobCancelled:
+        # Job was cancelled by the user — report as complete with current counts
+        await _send_progress(leads_sent, _stage_msg(leads_sent, max_results, phase="done"))
+        try:
+            async with session.post(
+                f"{API_URL}/internal/workers/jobs/{job_id}/complete",
+                headers=_worker_headers(),
+                json={"count": leads_sent, "new_count": new_leads},
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("complete endpoint returned %d", resp.status)
+        except Exception:
+            pass
+        elapsed = time.monotonic() - start_ts
+        metrics.log_summary(final=True)
+        logger.info(
+            "job_cancelled job=%s leads_sent=%d elapsed=%.1fs",
+            job_id, leads_sent, elapsed,
         )
 
     except Exception as exc:
@@ -635,32 +690,8 @@ async def _poll_loop(session: aiohttp.ClientSession) -> None:
         await queue.ack(job.get("job_id", ""), session)
 
         async def _run(j=job):
-            job_id = j.get("job_id", "unknown")
             async with semaphore:
-                try:
-                    await asyncio.wait_for(_process_job(session, j), timeout=JOB_TIMEOUT)
-                except asyncio.TimeoutError:
-                    logger.error("job_timeout job=%s exceeded %ds — marking failed", job_id, JOB_TIMEOUT)
-                    try:
-                        await session.post(
-                            f"{API_URL}/internal/workers/jobs/{job_id}/error",
-                            headers=_worker_headers(),
-                            json={"error": f"Job timed out after {JOB_TIMEOUT}s"},
-                            timeout=aiohttp.ClientTimeout(total=10),
-                        )
-                    except Exception:
-                        pass
-                except Exception as exc:
-                    logger.error("job_crash job=%s error=%s", job_id, exc, exc_info=True)
-                    try:
-                        await session.post(
-                            f"{API_URL}/internal/workers/jobs/{job_id}/error",
-                            headers=_worker_headers(),
-                            json={"error": str(exc)[:500]},
-                            timeout=aiohttp.ClientTimeout(total=10),
-                        )
-                    except Exception:
-                        pass
+                await _process_job(session, j)
 
         asyncio.create_task(_run())
 
