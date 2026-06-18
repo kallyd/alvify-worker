@@ -528,6 +528,24 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             except Exception as enrich_exc:
                 logger.debug("enrichment failed for %s: %s", lead_dict.get("website"), enrich_exc)
 
+        # ── Instagram discovery (Google Search, optional) ─────────────────────
+        if not lead_dict.get("instagram"):
+            try:
+                from core.instagram_discovery import discover_instagram, INSTAGRAM_DISCOVERY_ENABLED
+                if INSTAGRAM_DISCOVERY_ENABLED and browser_pool and browser_pool.is_started:
+                    ig_url = await discover_instagram(
+                        name=lead_dict.get("name", ""),
+                        city=lead_dict.get("city", ""),
+                        pool=browser_pool,
+                    )
+                    if ig_url:
+                        lead_dict["instagram"] = ig_url
+                        socials = lead_dict.get("socials") or {}
+                        socials["instagram"] = ig_url
+                        lead_dict["socials"] = socials
+            except Exception as ig_exc:
+                logger.debug("instagram discovery failed for %s: %s", lead_dict.get("name"), ig_exc)
+
         # ── CNPJ enrichment (hybrid: Maps lead + cadastral data) ─────────────
         if CNPJ_ENRICHMENT_ENABLED and _cnpj_client and lead_dict.get("source") != "cnpj_database":
             try:
