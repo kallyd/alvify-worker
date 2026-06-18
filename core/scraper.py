@@ -361,6 +361,138 @@ async def _extrair_detalhe(
         if m:
             neighborhood = m.group(1).strip()
 
+    # ── Extended data extraction (new fields) ─────────────────────────────────
+
+    # Place ID and coordinates from the page URL
+    place_id: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    try:
+        current_url = page.url
+        # Place ID from data param
+        pid_m = re.search(r"!1s(0x[a-f0-9]+:0x[a-f0-9]+)", current_url)
+        if pid_m:
+            place_id = pid_m.group(1)
+        # Lat/lng from @lat,lng pattern
+        coord_m = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", current_url)
+        if coord_m:
+            latitude = float(coord_m.group(1))
+            longitude = float(coord_m.group(2))
+    except Exception:
+        pass
+
+    # Photos count
+    photos_count: int = 0
+    try:
+        _photos_btn = page.locator('button[aria-label*="foto"], button[aria-label*="photo"]').first
+        _photos_lbl = await _photos_btn.get_attribute("aria-label", timeout=2000)
+        if _photos_lbl:
+            _photos_m = re.search(r"(\d+)", _photos_lbl.replace(".", "").replace(",", ""))
+            if _photos_m:
+                photos_count = int(_photos_m.group(1))
+    except Exception:
+        pass
+
+    # Price level ($, $$, $$$)
+    price_level: Optional[str] = None
+    try:
+        _price_el = page.locator('span[aria-label*="Price"], span[aria-label*="preço"]').first
+        _price_txt = await _price_el.text_content(timeout=1500)
+        if _price_txt:
+            _price_m = re.search(r"(\$+|R\$+)", _price_txt.strip())
+            if _price_m:
+                price_level = _price_m.group(1)
+    except Exception:
+        pass
+
+    # Business description (About section)
+    description: Optional[str] = None
+    try:
+        _desc_el = page.locator('div.WeS02d div.PYvSYb, div[data-attrid="subtitle"] span, div.bfdHYd span').first
+        _desc_txt = await _desc_el.text_content(timeout=2000)
+        if _desc_txt and len(_desc_txt.strip()) > 5:
+            description = _desc_txt.strip()[:300]
+    except Exception:
+        pass
+
+    # Google Posts (business updates)
+    has_google_posts: bool = False
+    try:
+        _posts_count = await page.locator('div[jsaction*="posts"], div[aria-label*="Updates"], div[aria-label*="Novidades"]').count()
+        has_google_posts = _posts_count > 0
+    except Exception:
+        pass
+
+    # Facebook link
+    facebook: Optional[str] = None
+    try:
+        _painel = page.locator('div[role="main"]').first
+        _fb_links = _painel.locator('a[href*="facebook.com"]')
+        _fb_count = await _fb_links.count()
+        for _i in range(_fb_count):
+            _fb_href = await _fb_links.nth(_i).get_attribute("href") or ""
+            if "facebook.com" in _fb_href and "/share" not in _fb_href:
+                facebook = _fb_href.split("?")[0].rstrip("/")
+                break
+    except Exception:
+        pass
+
+    # Additional social media links
+    socials: dict = {}
+    if instagram:
+        socials["instagram"] = instagram
+    if facebook:
+        socials["facebook"] = facebook
+    for _platform, _domain in [("twitter", "twitter.com"), ("twitter", "x.com"), ("youtube", "youtube.com"), ("tiktok", "tiktok.com")]:
+        try:
+            _soc_links = page.locator(f'div[role="main"] a[href*="{_domain}"]')
+            _soc_count = await _soc_links.count()
+            if _soc_count > 0:
+                _soc_href = await _soc_links.first.get_attribute("href") or ""
+                if _soc_href and "/share" not in _soc_href and "/intent" not in _soc_href:
+                    socials[_platform] = _soc_href.split("?")[0].rstrip("/")
+        except Exception:
+            pass
+
+    # Service options (dine-in, delivery, takeaway)
+    service_options: list[str] = []
+    try:
+        _svc_els = page.locator('div[data-item-id*="service"] span.MkV9')
+        _svc_count = await _svc_els.count()
+        for _i in range(min(_svc_count, 10)):
+            _svc_txt = await _svc_els.nth(_i).text_content(timeout=1000)
+            if _svc_txt and _svc_txt.strip():
+                service_options.append(_svc_txt.strip())
+    except Exception:
+        pass
+
+    # Full hours (all days)
+    full_hours: Optional[dict] = None
+    try:
+        _hours_table = page.locator('[data-item-id="oh"] table tr')
+        _hours_count = await _hours_table.count()
+        if _hours_count > 0:
+            full_hours = {}
+            for _i in range(min(_hours_count, 7)):
+                _tds = _hours_table.nth(_i).locator("td")
+                if await _tds.count() >= 2:
+                    _day = (await _tds.nth(0).text_content(timeout=800) or "").strip()
+                    _hrs = (await _tds.nth(1).text_content(timeout=800) or "").strip()
+                    if _day:
+                        full_hours[_day] = _hrs
+    except Exception:
+        pass
+
+    # Owner verified (claimed business)
+    owner_verified: bool = False
+    try:
+        _claimed = await page.locator('span:has-text("Reivindicad"), span:has-text("Claimed")').count()
+        owner_verified = _claimed > 0
+    except Exception:
+        pass
+
+    # ── Scoring ───────────────────────────────────────────────────────────────
+
     has_website   = bool(site)
     has_phone     = bool(telefone)
     has_instagram = bool(instagram)
@@ -418,6 +550,19 @@ async def _extrair_detalhe(
         photo_url=photo_url,
         status="new",
         source="google_maps",
+        # Extended fields
+        place_id=place_id,
+        latitude=latitude,
+        longitude=longitude,
+        photos_count=photos_count,
+        price_level=price_level,
+        description=description,
+        has_google_posts=has_google_posts,
+        facebook=facebook,
+        socials=socials,
+        service_options=service_options or None,
+        full_hours=full_hours,
+        owner_verified=owner_verified,
         # Internal flag consumed by scrape_leads() — not persisted to the DB.
         # True when the city was verified from the address (or no address exists).
         _city_confirmed=_city_confirmed,
@@ -446,7 +591,8 @@ async def _collect_place_urls(
             if not await _detectar_captcha(page):
                 break
             if attempt < _RETRY_ATTEMPTS - 1:
-                wait = 5 * (attempt + 1)
+                # Exponential backoff: 5s, 15s, 45s, 90s
+                wait = min(90, 5 * (3 ** attempt))
                 logger.warning(
                     "Scraper phase-1: captcha detected (attempt %d/%d) — retrying in %ds",
                     attempt + 1, _RETRY_ATTEMPTS, wait,
@@ -465,14 +611,18 @@ async def _collect_place_urls(
             logger.warning("Scraper phase-1: feed not found")
             return []
 
+        # Over-fetch: scroll for 30% more than requested to compensate for
+        # city filtering and dedup that will remove some results downstream.
+        scroll_target = int(max_results * 1.3)
+
         prev_count = 0
         stuck      = 0
-        max_scrolls = max(5, max_results // 5 + 4)
+        max_scrolls = max(5, scroll_target // 5 + 4)
         for _ in range(max_scrolls):
             await page.eval_on_selector(feed_sel, f"el=>el.scrollBy(0,{_SCROLL_PX})")
             await asyncio.sleep(_SCROLL_PAUSE_S)
             curr = await page.locator(f'{feed_sel} a[href*="/maps/place/"]').count()
-            if curr >= max_results:
+            if curr >= scroll_target:
                 break
             if curr == prev_count:
                 stuck += 1
@@ -483,7 +633,7 @@ async def _collect_place_urls(
             prev_count = curr
 
         links_loc = page.locator(f'{feed_sel} a[href*="/maps/place/"]')
-        total = min(await links_loc.count(), max_results)
+        total = min(await links_loc.count(), scroll_target)
         results: list[dict] = []
         for i in range(total):
             try:

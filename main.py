@@ -77,6 +77,12 @@ BATCH_TIMEOUT: float = float(os.environ.get("BATCH_TIMEOUT", "3"))
 ENRICHMENT_ENABLED: bool  = os.environ.get("ENRICHMENT_ENABLED", "true").lower() not in ("0", "false", "no")
 ENRICHMENT_TIMEOUT: float = float(os.environ.get("ENRICHMENT_TIMEOUT", "15"))
 
+# CNPJ API integration (api-db)
+CNPJ_API_URL: str = os.environ.get("CNPJ_API_URL", "https://api-cnpj.alvify.com.br").rstrip("/")
+CNPJ_API_KEY: str = os.environ.get("CNPJ_API_KEY", "")
+CNPJ_ENRICHMENT_ENABLED: bool = os.environ.get("CNPJ_ENRICHMENT_ENABLED", "true").lower() not in ("0", "false", "no")
+CNPJ_ENRICHMENT_TIMEOUT: float = float(os.environ.get("CNPJ_ENRICHMENT_TIMEOUT", "5"))
+
 # API endpoints
 POLL_URL      = f"{API_URL}/internal/workers/jobs/poll"
 HEARTBEAT_URL = f"{API_URL}/internal/workers/heartbeat"
@@ -93,6 +99,17 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("alvify.worker")
+
+# ── CNPJ API client (global, reused across jobs) ─────────────────────────────
+
+_cnpj_client = None
+if CNPJ_API_URL:
+    from core.cnpj_client import CnpjApiClient
+    _cnpj_client = CnpjApiClient(
+        base_url=CNPJ_API_URL,
+        api_key=CNPJ_API_KEY,
+        timeout=CNPJ_ENRICHMENT_TIMEOUT,
+    )
 
 
 # ── Auth headers ──────────────────────────────────────────────────────────────
@@ -298,6 +315,41 @@ async def _flush_batch(
     return sent, new_c
 
 
+# ── Score boost with cadastral data ──────────────────────────────────────────
+
+def _boost_score_with_cadastral(lead: dict) -> None:
+    """
+    Recalculate the lead's score incorporating cadastral data from api-db.
+    Mutates lead["score"] and lead["tags"] in-place.
+    """
+    score = lead.get("score", 50)
+    tags = lead.get("tags", [])
+
+    porte = lead.get("porte_empresa", 0)
+    capital = lead.get("capital_social", 0)
+
+    # Porte bonus
+    if porte == 3:      # EPP — ideal size for prospecting
+        score += 5
+        if "EPP" not in tags:
+            tags.append("EPP")
+    elif porte == 5:    # Grande — has budget
+        score += 3
+    elif porte == 1:    # ME/MEI
+        score += 2
+
+    # Capital social bonus
+    if capital >= 500_000:
+        score += 5
+        if "capital alto" not in tags:
+            tags.append("capital alto")
+    elif capital >= 100_000:
+        score += 3
+
+    lead["score"] = min(99, score)
+    lead["tags"] = tags
+
+
 # ── Job processor ─────────────────────────────────────────────────────────────
 
 async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
@@ -319,12 +371,23 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
     start_ts = time.monotonic()
 
     # ── Per-job objects ───────────────────────────────────────────────────────
-    from core.dedup import LocalDedup
+    from core.dedup import LocalDedup, GlobalDedup
     from core.metrics import JobMetrics
 
     dedup   = LocalDedup()
     metrics = JobMetrics(job_id=job_id)
     metrics.start()
+
+    # Global dedup (cross-job, Redis-backed, optional)
+    _global_dedup = None
+    if REDIS_URL and os.environ.get("GLOBAL_DEDUP_ENABLED", "true").lower() not in ("0", "false", "no"):
+        try:
+            import redis.asyncio as aioredis
+            _dedup_redis = aioredis.from_url(REDIS_URL, socket_connect_timeout=2)
+            _global_dedup = GlobalDedup(_dedup_redis)
+            logger.debug("job=%s global_dedup enabled", job_id)
+        except Exception as exc:
+            logger.debug("job=%s global_dedup init failed: %s", job_id, exc)
 
     # Batch buffer: accumulated leads waiting to be flushed
     _batch: list[dict] = []
@@ -412,11 +475,13 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         """
         Called by the scraper after each lead is extracted.
 
-        1. Skip duplicates (local dedup)
+        1. Skip duplicates (global cross-job dedup, then local per-job dedup)
         2. Run enrichment pipeline (website, email, socials, technologies)
-        3. Add to batch buffer
-        4. Flush if batch is full or timeout elapsed
-        5. Send progress update to API
+        3. CNPJ enrichment (hybrid: Maps lead + cadastral data)
+        4. Digital diagnosis
+        5. Add to batch buffer
+        6. Flush if batch is full or timeout elapsed
+        7. Send progress update to API
         """
         nonlocal leads_sent, new_leads
 
@@ -428,6 +493,18 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
                 "job=%s lead_extracted n=%d name=%r city=%r phone=%r",
                 job_id, n, lead_dict.get("name"), lead_dict.get("city"), lead_dict.get("phone"),
             )
+
+        # ── Global dedup (cross-job, Redis-backed) ────────────────────────────
+        if _global_dedup:
+            try:
+                if await _global_dedup.check_and_register(lead_dict):
+                    logger.debug(
+                        "job=%s global_dedup_skip n=%d name=%r",
+                        job_id, n, lead_dict.get("name"),
+                    )
+                    return
+            except Exception:
+                pass  # Redis failure — continue with local dedup only
 
         # ── Local dedup ───────────────────────────────────────────────────────
         if dedup.check_and_register(lead_dict):
@@ -451,6 +528,55 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             except Exception as enrich_exc:
                 logger.debug("enrichment failed for %s: %s", lead_dict.get("website"), enrich_exc)
 
+        # ── CNPJ enrichment (hybrid: Maps lead + cadastral data) ─────────────
+        if CNPJ_ENRICHMENT_ENABLED and _cnpj_client and lead_dict.get("source") != "cnpj_database":
+            try:
+                matches = await _cnpj_client.search(
+                    session,
+                    nome_fantasia=lead_dict.get("name", ""),
+                    cidade=lead_dict.get("city", ""),
+                    situacao=2,
+                    limit=1,
+                )
+                if matches:
+                    empresa = matches[0]
+                    lead_dict["cnpj"] = empresa.get("cnpj", "")
+                    lead_dict["razao_social"] = empresa.get("razao_social", "")
+                    lead_dict["cnae_fiscal"] = empresa.get("cnae_fiscal", "")
+                    lead_dict["capital_social"] = float(empresa.get("capital_social") or 0)
+                    lead_dict["porte_empresa"] = int(empresa.get("porte_empresa") or 0)
+                    lead_dict["data_abertura"] = empresa.get("data_abertura", "")
+                    lead_dict["opcao_mei"] = empresa.get("opcao_mei", False)
+                    # Email from RF if lead has none
+                    if not lead_dict.get("emails") and empresa.get("email"):
+                        lead_dict.setdefault("emails", []).append(empresa["email"])
+                    # Recalculate score with cadastral data
+                    _boost_score_with_cadastral(lead_dict)
+            except Exception as cnpj_exc:
+                logger.debug("cnpj enrichment failed for %s: %s", lead_dict.get("name"), cnpj_exc)
+
+        # ── Digital diagnosis (service-need tags for marketing) ───────────────
+        try:
+            from core.enrichment import enrich_lead_with_diagnosis
+            enrich_lead_with_diagnosis(lead_dict)
+        except Exception as diag_exc:
+            logger.debug("digital diagnosis failed for %s: %s", lead_dict.get("name"), diag_exc)
+
+        # ── Quality validation ────────────────────────────────────────────────
+        try:
+            from core.validators import validate_lead_quality
+            quality_score, quality_issues = validate_lead_quality(lead_dict)
+            lead_dict["quality_score"] = quality_score
+            lead_dict["quality_issues"] = quality_issues
+            if quality_score < int(os.environ.get("QUALITY_SCORE_MIN", "20")):
+                logger.debug(
+                    "job=%s quality_skip n=%d name=%r score=%d issues=%s",
+                    job_id, n, lead_dict.get("name"), quality_score, quality_issues,
+                )
+                return
+        except Exception as val_exc:
+            logger.debug("validation failed for %s: %s", lead_dict.get("name"), val_exc)
+
         _batch.append(lead_dict)
         
         logger.debug(
@@ -465,32 +591,88 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         await _send_progress(n, _stage_msg(n, max_results, phase="extracting", name=lead_dict.get("name", "")))
 
     try:
-        from core.scraper import scrape_leads
-        from core.browser_pool import browser_pool
-
-        if not browser_pool.is_started:
-            await browser_pool.start()
-
         # Announce init
         await _send_progress(0, _stage_msg(0, max_results, phase="init"))
 
-        # ── Run scraper ───────────────────────────────────────────────────────
-        # scrape_leads calls _progress_cb for each extracted lead.
-        # It accepts an optional place_cache argument for per-URL caching.
-        scrape_kwargs: dict = dict(
-            keyword=keyword,
-            city=city,
-            state=state,
-            max_results=max_results,
-            country=country,
-            pool=browser_pool,
-            progress_cb=_progress_cb,
-            metrics=metrics,
-        )
-        if _place_cache is not None:
-            scrape_kwargs["place_cache"] = _place_cache
+        # ── Job type routing ──────────────────────────────────────────────────
+        job_type = job.get("type", "google_maps")
 
-        await scrape_leads(**scrape_kwargs)
+        if job_type in ("cadastral", "empresas_novas"):
+            # Cadastral scraper — queries api-db directly, no browser needed.
+            from core.cadastral_scraper import scrape_leads as cadastral_scrape
+
+            extra_filters: dict = {}
+            if job_type == "empresas_novas":
+                from datetime import datetime, timedelta
+                seven_days_ago = (datetime.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+                extra_filters["data_abertura_de"] = job.get("data_abertura_de", seven_days_ago)
+                if job.get("data_abertura_ate"):
+                    extra_filters["data_abertura_ate"] = job["data_abertura_ate"]
+
+            # Optional filters from job dict
+            if job.get("ddd"):
+                extra_filters["ddd"] = job["ddd"]
+            if job.get("porte"):
+                extra_filters["porte"] = int(job["porte"])
+            if job.get("mei") is not None:
+                extra_filters["mei"] = job["mei"]
+            if job.get("simples") is not None:
+                extra_filters["simples"] = job["simples"]
+            if job.get("tem_email") is not None:
+                extra_filters["tem_email"] = job["tem_email"]
+            if job.get("tem_telefone") is not None:
+                extra_filters["tem_telefone"] = job["tem_telefone"]
+
+            await cadastral_scrape(
+                keyword=keyword,
+                city=city,
+                state=state,
+                max_results=max_results,
+                country=country,
+                progress_cb=_progress_cb,
+                cnpj_client=_cnpj_client,
+                metrics=metrics,
+                session=session,
+                **extra_filters,
+            )
+
+        else:
+            # Google Maps scraper (default) — uses Playwright browser pool.
+            from core.scraper import scrape_leads as maps_scrape_leads
+            from core.browser_pool import browser_pool
+            from core.grid_search import grid_scrape, get_city_coords, GRID_SEARCH_THRESHOLD
+
+            if not browser_pool.is_started:
+                await browser_pool.start()
+
+            # Use grid search for large result sets in known cities.
+            if max_results > GRID_SEARCH_THRESHOLD and get_city_coords(city):
+                await grid_scrape(
+                    keyword=keyword,
+                    city=city,
+                    state=state,
+                    max_results=max_results,
+                    country=country,
+                    progress_cb=_progress_cb,
+                    pool=browser_pool,
+                    metrics=metrics,
+                    place_cache=_place_cache,
+                )
+            else:
+                scrape_kwargs: dict = dict(
+                    keyword=keyword,
+                    city=city,
+                    state=state,
+                    max_results=max_results,
+                    country=country,
+                    pool=browser_pool,
+                    progress_cb=_progress_cb,
+                    metrics=metrics,
+                )
+                if _place_cache is not None:
+                    scrape_kwargs["place_cache"] = _place_cache
+
+                await maps_scrape_leads(**scrape_kwargs)
 
         # ── Final flush of any remaining buffered leads ───────────────────────
         logger.info(
@@ -536,10 +718,15 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
             pass
     finally:
         _active_jobs -= 1
-        # Close the per-job Redis connection if we opened one
+        # Close the per-job Redis connections if we opened them
         if _place_cache is not None and hasattr(_place_cache, "_redis"):
             try:
                 await _place_cache._redis.aclose()
+            except Exception:
+                pass
+        if _global_dedup is not None and hasattr(_global_dedup, "_redis"):
+            try:
+                await _global_dedup._redis.aclose()
             except Exception:
                 pass
 
