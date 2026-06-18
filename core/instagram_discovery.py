@@ -38,10 +38,11 @@ from urllib.parse import quote_plus, unquote
 
 logger = logging.getLogger("alvify.instagram_discovery")
 
-# Enable/disable via env var
+# Enable/disable via env var — DISABLED by default on datacenter IPs.
+# Enable when you have residential proxies configured or run from a non-DC IP.
 INSTAGRAM_DISCOVERY_ENABLED = os.environ.get(
-    "INSTAGRAM_DISCOVERY_ENABLED", "true"
-).lower() not in ("0", "false", "no")
+    "INSTAGRAM_DISCOVERY_ENABLED", "false"
+).lower() in ("1", "true", "yes")
 
 # Delay between searches (seconds) — be respectful to avoid blocks
 SEARCH_DELAY = float(os.environ.get("INSTAGRAM_SEARCH_DELAY", "5"))
@@ -100,50 +101,49 @@ async def discover_instagram(
         return None
 
     query = _build_search_query(name, city)
-    search_url = f"https://www.google.com/search?q={quote_plus(query)}&num=5&hl=pt-BR"
+    search_url = f"https://duckduckgo.com/html/?q={quote_plus(query)}"
 
     async def _run(page) -> Optional[str]:
         try:
             await page.goto(search_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
-            await asyncio.sleep(2)
-
-            # Check for CAPTCHA/block
-            current_url = page.url
-            if "/sorry/" in current_url or "captcha" in current_url:
-                logger.warning("instagram_discovery: Google blocked (captcha) — stopping")
-                return None
+            await asyncio.sleep(1.5)
 
             content = await page.content()
-            if "unusual traffic" in content.lower():
-                logger.warning("instagram_discovery: Google rate-limited")
-                return None
 
-            # Strategy 1: Extract @ handle from search result titles (h3)
-            # Google shows: "Business Name (@handle) • Instagram"
-            titles = page.locator("h3")
+            # Strategy 1: Extract @ handle from result titles
+            # DuckDuckGo shows: "Cristianini's - Francisco Alves (@cristianinis.burgers)"
+            titles = page.locator("a.result__a, h2.result__title a")
             title_count = await titles.count()
 
-            for i in range(min(title_count, 5)):
+            for i in range(min(title_count, 8)):
                 try:
                     title_text = await titles.nth(i).text_content() or ""
+                    # Look for (@handle) in title
                     handle_match = _HANDLE_IN_TITLE_RE.search(title_text)
                     if handle_match:
                         handle = handle_match.group(1).rstrip(".")
                         if _is_valid_handle(handle):
                             return f"https://www.instagram.com/{handle}"
+
+                    # Also check the href
+                    href = await titles.nth(i).get_attribute("href") or ""
+                    if "instagram.com" in href:
+                        ig_match = _INSTAGRAM_URL_RE.search(href)
+                        if ig_match:
+                            handle = ig_match.group(1).rstrip("/")
+                            if _is_valid_handle(handle):
+                                return f"https://www.instagram.com/{handle}"
                 except Exception:
                     continue
 
-            # Strategy 2: Look in cite/breadcrumb elements
-            # Google shows URLs like "instagram.com › handle"
-            cites = page.locator("cite, span.VuuXrf, span.qLRx3b")
-            cite_count = await cites.count()
-            for i in range(min(cite_count, 10)):
+            # Strategy 2: Look for instagram.com in result URLs/snippets
+            result_links = page.locator("a.result__url, span.result__url")
+            link_count = await result_links.count()
+            for i in range(min(link_count, 8)):
                 try:
-                    cite_text = await cites.nth(i).text_content() or ""
-                    if "instagram.com" in cite_text:
-                        # Pattern: "instagram.com › handle" or "instagram.com/handle"
-                        m = re.search(r"instagram\.com\s*[›/]\s*([a-zA-Z0-9_.]+)", cite_text)
+                    link_text = await result_links.nth(i).text_content() or ""
+                    if "instagram.com" in link_text:
+                        m = re.search(r"instagram\.com/([a-zA-Z0-9_.]+)", link_text)
                         if m:
                             handle = m.group(1).rstrip(".")
                             if _is_valid_handle(handle):
@@ -151,7 +151,7 @@ async def discover_instagram(
                 except Exception:
                     continue
 
-            # Strategy 3: Search full page HTML for instagram.com/handle patterns
+            # Strategy 3: Regex fallback on full page content
             all_matches = _INSTAGRAM_URL_RE.findall(content)
             seen: set[str] = set()
             for handle in all_matches:
