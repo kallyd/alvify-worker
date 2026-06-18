@@ -531,7 +531,8 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         # ── Instagram discovery (Google Search, optional) ─────────────────────
         if not lead_dict.get("instagram"):
             try:
-                from core.instagram_discovery import discover_instagram, INSTAGRAM_DISCOVERY_ENABLED
+                from core.instagram_discovery import discover_instagram, discover_instagram_llm, INSTAGRAM_DISCOVERY_ENABLED, OPENROUTER_API_KEY
+                # Priority 1: Search engine (if enabled and proxy available)
                 if INSTAGRAM_DISCOVERY_ENABLED and browser_pool and browser_pool.is_started:
                     ig_url = await discover_instagram(
                         name=lead_dict.get("name", ""),
@@ -543,6 +544,10 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
                         socials = lead_dict.get("socials") or {}
                         socials["instagram"] = ig_url
                         lead_dict["socials"] = socials
+                # Priority 2: LLM discovery (if API key configured)
+                elif OPENROUTER_API_KEY and not lead_dict.get("instagram"):
+                    found = await discover_instagram_llm([lead_dict])
+                    # lead_dict is modified in-place by the function
             except Exception as ig_exc:
                 logger.debug("instagram discovery failed for %s: %s", lead_dict.get("name"), ig_exc)
 

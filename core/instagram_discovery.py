@@ -260,6 +260,133 @@ async def discover_instagram_batch(
     )
     return discovered
 
+
+# ── LLM-based Instagram Discovery (via OpenRouter) ───────────────────────────
+
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.environ.get(
+    "OPENROUTER_MODEL", "google/gemini-flash-1.5"
+)
+
+
+async def discover_instagram_llm(
+    leads: list[dict],
+    api_key: str = None,
+    model: str = None,
+    batch_size: int = 10,
+) -> int:
+    """
+    Use an LLM (via OpenRouter) to discover Instagram handles for leads.
+
+    The LLM is asked to find the Instagram @ for each business based on
+    its name and city. Works from any IP (no search engine needed).
+
+    Modifies leads in-place. Returns number of profiles discovered.
+    """
+    import aiohttp
+    import json
+
+    _api_key = api_key or OPENROUTER_API_KEY
+    _model = model or OPENROUTER_MODEL
+
+    if not _api_key:
+        logger.debug("instagram_llm: no OPENROUTER_API_KEY configured")
+        return 0
+
+    # Filter leads that need Instagram
+    needs_ig = [
+        (i, lead) for i, lead in enumerate(leads)
+        if not lead.get("instagram") and lead.get("name") and lead.get("city")
+    ]
+
+    if not needs_ig:
+        return 0
+
+    discovered = 0
+
+    # Process in batches
+    for batch_start in range(0, len(needs_ig), batch_size):
+        batch = needs_ig[batch_start:batch_start + batch_size]
+
+        # Build prompt
+        lines = []
+        for idx, (_, lead) in enumerate(batch, 1):
+            name = lead.get("name", "")
+            city = lead.get("city", "")
+            state = lead.get("state", "")
+            lines.append(f"{idx}. {name} - {city}, {state}")
+
+        prompt = f"""Para cada negócio abaixo, informe o @ do Instagram. Se não souber, diga null.
+Responda SOMENTE com JSON puro, sem explicações.
+
+{chr(10).join(lines)}
+
+JSON (use os números como chave):"""
+
+        headers = {
+            "Authorization": f"Bearer {_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": _model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 2000,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://openrouter.ai/api/v1/chat/completions",
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        error = await resp.text()
+                        logger.warning("instagram_llm: API error %d: %s", resp.status, error[:200])
+                        continue
+
+                    data = await resp.json()
+                    content = data["choices"][0]["message"]["content"]
+
+                    # Parse JSON from response (handle markdown code blocks)
+                    content = content.strip()
+                    if content.startswith("```"):
+                        content = re.sub(r"^```\w*\n?", "", content)
+                        content = re.sub(r"\n?```$", "", content)
+
+                    results = json.loads(content)
+
+                    for idx, (lead_idx, lead) in enumerate(batch, 1):
+                        # Try numeric key first, then name key
+                        handle = results.get(str(idx))
+                        if not handle:
+                            handle = results.get(lead.get("name", ""))
+                        if handle and handle != "null" and str(handle).lower() != "none":
+                            # Clean handle
+                            handle = str(handle).lstrip("@").strip()
+                            if _is_valid_handle(handle):
+                                ig_url = f"https://www.instagram.com/{handle}"
+                                lead["instagram"] = ig_url
+                                socials = lead.get("socials") or {}
+                                socials["instagram"] = ig_url
+                                lead["socials"] = socials
+                                discovered += 1
+                                logger.info(
+                                    "instagram_llm: found @%s for %r",
+                                    handle, lead.get("name"),
+                                )
+
+        except json.JSONDecodeError as e:
+            logger.warning("instagram_llm: failed to parse response: %s", e)
+        except Exception as exc:
+            logger.warning("instagram_llm: error: %s", exc)
+
+    logger.info("instagram_llm: discovered %d profiles for %d leads", discovered, len(needs_ig))
+    return discovered
+
     async def _run(page) -> Optional[str]:
         try:
             await page.goto(search_url, wait_until="domcontentloaded", timeout=int(timeout * 1000))
