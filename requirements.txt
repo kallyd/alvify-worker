@@ -5,3 +5,4 @@ psutil
 sqlalchemy[asyncio]
 asyncpg
 python-dotenv
+websockets

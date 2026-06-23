@@ -534,26 +534,36 @@ async def _process_job(session: aiohttp.ClientSession, job: dict, global_place_c
         # Timeout: 10 minutes max per job to prevent infinite hangs
         _JOB_TIMEOUT = 600
         try:
-            await asyncio.wait_for(scrape_leads(**scrape_kwargs), timeout=_JOB_TIMEOUT)
+            scrape_result = await asyncio.wait_for(scrape_leads(**scrape_kwargs), timeout=_JOB_TIMEOUT)
         except asyncio.TimeoutError:
             raise TimeoutError(f"Busca excedeu o tempo limite de {_JOB_TIMEOUT // 60} minutos")
 
+        # Extract region exhaustion metadata from scraper result
+        region_exhausted = False
+        if isinstance(scrape_result, dict):
+            region_exhausted = scrape_result.get("region_exhausted", False)
+
         # ── Final flush of any remaining buffered leads ───────────────────────
         logger.info(
-            "job=%s scraping complete, final batch size=%d",
-            job_id, len(_batch),
+            "job=%s scraping complete, final batch size=%d region_exhausted=%s",
+            job_id, len(_batch), region_exhausted,
         )
-        
+
         if _batch:
             await _maybe_flush(force=True)
 
         # ── Mark job complete ─────────────────────────────────────────────────
         await _send_progress(leads_sent, _stage_msg(leads_sent, max_results, phase="done"))
 
+        complete_payload: dict = {"count": leads_sent, "new_count": new_leads}
+        if region_exhausted and leads_sent < max_results:
+            complete_payload["region_exhausted"] = True
+            complete_payload["requested"] = max_results
+
         async with session.post(
             f"{API_URL}/internal/workers/jobs/{job_id}/complete",
             headers=_worker_headers(),
-            json={"count": leads_sent, "new_count": new_leads},
+            json=complete_payload,
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
             if resp.status != 200:
@@ -666,13 +676,37 @@ async def _refresh_cache_entry(session: aiohttp.ClientSession, params: dict) -> 
 # ── Poll loop ─────────────────────────────────────────────────────────────────
 
 async def _poll_loop(session: aiohttp.ClientSession, global_place_cache=None) -> None:
-    from core.queue import make_queue_client
+    from core.queue import make_queue_client, WebSocketQueueClient, ApiPollQueueClient
 
     queue = make_queue_client(POLL_URL, _worker_headers)
     semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    logger.info("poll_start concurrency=%d batch_size=%d batch_timeout=%.1fs",
-                MAX_CONCURRENCY, BATCH_SIZE, BATCH_TIMEOUT)
+    # Determine if we should use WS with fallback
+    backend_mode = os.environ.get("QUEUE_BACKEND", "api").lower()
+    use_ws = isinstance(queue, WebSocketQueueClient)
+    ws_backoff = 1.0  # Exponential backoff for WS reconnects (seconds)
+    _WS_BACKOFF_MAX = 30.0
+
+    # Fallback HTTP client (created lazily if needed)
+    _fallback_queue = None
+
+    def _get_fallback():
+        nonlocal _fallback_queue
+        if _fallback_queue is None:
+            _fallback_queue = ApiPollQueueClient(POLL_URL, _worker_headers)
+        return _fallback_queue
+
+    logger.info("poll_start concurrency=%d batch_size=%d batch_timeout=%.1fs backend=%s",
+                MAX_CONCURRENCY, BATCH_SIZE, BATCH_TIMEOUT, backend_mode)
+
+    # ── Connect WS if applicable ─────────────────────────────────────────────
+    if use_ws:
+        connected = await queue.connect()
+        if connected:
+            ws_backoff = 1.0
+            logger.info("ws_dispatch_active — receiving jobs via WebSocket")
+        else:
+            logger.warning("ws_connect_failed — falling back to HTTP poll")
 
     while True:
         # Back-pressure: wait if we are already at capacity
@@ -694,9 +728,37 @@ async def _poll_loop(session: aiohttp.ClientSession, global_place_cache=None) ->
                 pass
 
         # ── Poll for the next job ─────────────────────────────────────────────
-        job = await queue.poll(session)
+        job = None
+
+        if use_ws and queue.connected:
+            # Primary path: receive via WebSocket
+            job = await queue.poll(session)
+            if job is None and not queue.connected:
+                # WS disconnected mid-poll — will reconnect below
+                logger.warning("ws_disconnected — attempting reconnect")
+        elif use_ws and not queue.connected:
+            # WS mode but disconnected — try reconnecting with backoff
+            logger.info("ws_reconnect backoff=%.1fs", ws_backoff)
+            await asyncio.sleep(ws_backoff)
+            connected = await queue.connect()
+            if connected:
+                ws_backoff = 1.0
+                logger.info("ws_reconnected")
+                continue
+            else:
+                # Increase backoff, use HTTP fallback for this iteration
+                ws_backoff = min(ws_backoff * 2, _WS_BACKOFF_MAX)
+                if backend_mode == "auto":
+                    job = await _get_fallback().poll(session)
+                else:
+                    # Pure ws mode: just retry
+                    continue
+        else:
+            # HTTP poll mode (default)
+            job = await queue.poll(session)
+
         if job is None:
-            # No job available (204 or timeout) — immediately re-poll.
+            # No job available (timeout or empty) — immediately re-poll.
             continue
 
         await queue.ack(job.get("job_id", ""), session)
