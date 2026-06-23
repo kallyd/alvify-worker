@@ -329,7 +329,7 @@ async def check_job_status(
 
 # ── Job processor ─────────────────────────────────────────────────────────────
 
-async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
+async def _process_job(session: aiohttp.ClientSession, job: dict, global_place_cache=None) -> None:
     global _active_jobs
 
     job_id      = job["job_id"]
@@ -358,27 +358,32 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
     # Batch buffer: accumulated leads waiting to be flushed
     _batch: list[dict] = []
     _last_flush_ts = time.monotonic()
+    _first_lead_flushed = False  # Track whether we've sent the first lead immediately
     leads_sent = 0
     new_leads  = 0
 
-    # ── Optional: place cache (requires REDIS_URL) ────────────────────────────
-    _place_cache = None
-    if REDIS_URL:
+    # ── Place cache: reuse global connection or fallback to per-job ───────────
+    _place_cache = global_place_cache
+    if _place_cache is None and REDIS_URL:
         try:
             import redis.asyncio as aioredis
             from core.place_cache import PlaceCache
             _redis = aioredis.from_url(REDIS_URL, socket_connect_timeout=2)
             _place_cache = PlaceCache(_redis)
-            logger.debug("job=%s place_cache enabled", job_id)
+            logger.debug("job=%s place_cache fallback enabled", job_id)
         except Exception as exc:
             logger.debug("job=%s place_cache init failed: %s", job_id, exc)
 
     async def _maybe_flush(force: bool = False) -> None:
         """Flush the batch buffer if full or timed out."""
-        nonlocal leads_sent, new_leads, _batch, _last_flush_ts
+        nonlocal leads_sent, new_leads, _batch, _last_flush_ts, _first_lead_flushed
+
+        # Flush immediately for the first lead — user sees results faster
+        is_first_lead = not _first_lead_flushed and len(_batch) > 0
 
         should_flush = (
             force
+            or is_first_lead
             or len(_batch) >= BATCH_SIZE
             or (len(_batch) > 0 and time.monotonic() - _last_flush_ts >= BATCH_TIMEOUT)
         )
@@ -396,6 +401,7 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         to_send = _batch[:]
         _batch.clear()
         _last_flush_ts = time.monotonic()
+        _first_lead_flushed = True
 
         logger.info(
             "job=%s flushing batch of %d leads",
@@ -463,6 +469,10 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         """
         nonlocal leads_sent, new_leads
 
+        # Stop accepting leads if we've already sent enough
+        if leads_sent + len(_batch) >= max_results:
+            return
+
         metrics.lead_scraped()
 
         # DEBUG: log first 3 leads to diagnose dedup issue
@@ -498,7 +508,9 @@ async def _process_job(session: aiohttp.ClientSession, job: dict) -> None:
         from core.scraper import scrape_leads
         from core.browser_pool import browser_pool
 
+        # Pool is pre-warmed at startup; only start if somehow not ready (shouldn't happen)
         if not browser_pool.is_started:
+            logger.warning("job=%s browser_pool not started, starting now (unexpected)", job_id)
             await browser_pool.start()
 
         # Announce init
@@ -653,7 +665,7 @@ async def _refresh_cache_entry(session: aiohttp.ClientSession, params: dict) -> 
 
 # ── Poll loop ─────────────────────────────────────────────────────────────────
 
-async def _poll_loop(session: aiohttp.ClientSession) -> None:
+async def _poll_loop(session: aiohttp.ClientSession, global_place_cache=None) -> None:
     from core.queue import make_queue_client
 
     queue = make_queue_client(POLL_URL, _worker_headers)
@@ -691,7 +703,7 @@ async def _poll_loop(session: aiohttp.ClientSession) -> None:
 
         async def _run(j=job):
             async with semaphore:
-                await _process_job(session, j)
+                await _process_job(session, j, global_place_cache)
 
         asyncio.create_task(_run())
 
@@ -707,6 +719,25 @@ async def main() -> None:
         "worker_start version=%s id=%s api=%s concurrency=%d",
         VERSION, WORKER_ID, API_URL, MAX_CONCURRENCY,
     )
+
+    # ── Pre-warm browser pool at startup (eliminates cold-start penalty) ─────
+    from core.browser_pool import browser_pool
+    logger.info("pre-warming browser pool...")
+    await browser_pool.start()
+    logger.info("browser pool ready")
+
+    # ── Pre-connect Redis for place cache (eliminates per-job connect cost) ──
+    _global_place_cache = None
+    if REDIS_URL:
+        try:
+            import redis.asyncio as aioredis
+            from core.place_cache import PlaceCache
+            _global_redis = aioredis.from_url(REDIS_URL, socket_connect_timeout=2)
+            await _global_redis.ping()  # Verify connection works
+            _global_place_cache = PlaceCache(_global_redis)
+            logger.info("place_cache pre-connected")
+        except Exception as exc:
+            logger.warning("place_cache pre-connect failed: %s — will retry per-job", exc)
 
     connector = aiohttp.TCPConnector(limit=MAX_CONCURRENCY * 6)
     async with aiohttp.ClientSession(connector=connector) as session:
@@ -728,7 +759,7 @@ async def main() -> None:
 
         await asyncio.gather(
             _heartbeat_loop(session),
-            _poll_loop(session),
+            _poll_loop(session, _global_place_cache),
             _health_server(),
         )
 

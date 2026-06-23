@@ -83,7 +83,7 @@ _BR_STATES = frozenset({
 })
 
 _SCROLL_PX         = 3000    # pixels per scroll
-_SCROLL_PAUSE_S    = 0.8     # seconds between scrolls
+_SCROLL_PAUSE_S    = 0.4     # seconds between scrolls (reduced from 0.8)
 _MAX_STUCK_SCROLLS = 3       # stop after N scrolls with no new cards
 _RETRY_ATTEMPTS    = 3       # retries per place card (sequential fallback)
 _DETAIL_TIMEOUT    = 4_000   # ms waiting for h1 after navigating to place
@@ -117,7 +117,8 @@ async def _aceitar_cookies(page) -> None:
             btn = page.get_by_role("button", name=re.compile(text, re.IGNORECASE))
             if await btn.count():
                 await btn.first.click()
-                await asyncio.sleep(1)
+                # Wait just enough for the banner to dismiss
+                await asyncio.sleep(0.3)
                 return
         except Exception:
             pass
@@ -437,7 +438,7 @@ async def _collect_place_urls(
     Each dict has: url, name, rating, reviews, category (from feed cards).
     """
 
-    async def _run(page) -> list[str]:
+    async def _run(page) -> list[dict]:
         logger.info("Scraper phase-1: loading feed for '%s'", query)
 
         for attempt in range(_RETRY_ATTEMPTS):
@@ -512,6 +513,128 @@ async def _collect_place_urls(
 
         logger.info("Scraper phase-1: collected %d places for '%s'", len(results), query)
         return results
+
+    if pool is not None and pool.is_started:
+        async with pool.page() as page:
+            return await _run(page)
+    else:
+        from playwright.async_api import async_playwright
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(headless=True, args=_LAUNCH_ARGS)
+            ctx = await browser.new_context(
+                locale="pt-BR", timezone_id="America/Sao_Paulo",
+                user_agent=_random_ua(), viewport={"width": 1366, "height": 900},
+            )
+            await ctx.add_init_script(
+                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+            )
+            page = await ctx.new_page()
+            try:
+                return await _run(page)
+            finally:
+                await browser.close()
+
+
+# ── Phase 1 streaming: push URLs to queue during scroll ──────────────────────
+
+async def _stream_place_urls(
+    query: str,
+    search_url: str,
+    max_results: int,
+    url_queue: asyncio.Queue,
+    pool=None,
+) -> int:
+    """Scroll the Maps search feed and push place dicts into url_queue AS they
+    are discovered during scrolling. Returns total items pushed.
+
+    This enables consumers to start extracting while scrolling is still ongoing.
+    """
+
+    async def _run(page) -> int:
+        logger.info("Scraper phase-1 (streaming): loading feed for '%s'", query)
+
+        for attempt in range(_RETRY_ATTEMPTS):
+            await page.goto(search_url, wait_until="domcontentloaded", timeout=30_000)
+
+            if not await _detectar_captcha(page):
+                break
+            if attempt < _RETRY_ATTEMPTS - 1:
+                wait = 5 * (attempt + 1)
+                logger.warning(
+                    "Scraper phase-1: captcha detected (attempt %d/%d) — retrying in %ds",
+                    attempt + 1, _RETRY_ATTEMPTS, wait,
+                )
+                await asyncio.sleep(wait)
+        else:
+            logger.warning("Scraper phase-1: captcha persists after %d attempts — aborting", _RETRY_ATTEMPTS)
+            return 0
+
+        await _aceitar_cookies(page)
+
+        feed_sel = 'div[role="feed"]'
+        try:
+            await page.wait_for_selector(feed_sel, timeout=10_000)
+        except Exception:
+            logger.warning("Scraper phase-1: feed not found")
+            return 0
+
+        # Track which URLs we've already pushed to avoid duplicates
+        seen_urls: set[str] = set()
+        total_pushed = 0
+        prev_count = 0
+        stuck = 0
+        max_scrolls = max(5, max_results // 5 + 4)
+
+        for _ in range(max_scrolls):
+            await page.eval_on_selector(feed_sel, f"el=>el.scrollBy(0,{_SCROLL_PX})")
+            await asyncio.sleep(_SCROLL_PAUSE_S)
+
+            # Extract NEW cards that appeared after this scroll
+            links_loc = page.locator(f'{feed_sel} a[href*="/maps/place/"]')
+            curr = await links_loc.count()
+
+            # Push any new cards immediately
+            for i in range(prev_count, min(curr, max_results)):
+                try:
+                    el = links_loc.nth(i)
+                    href = await el.get_attribute("href")
+                    if not href or "/maps/place/" not in href:
+                        continue
+                    if href in seen_urls:
+                        continue
+                    seen_urls.add(href)
+                    card = await el.evaluate("""el => {
+                        const container = el.closest('[jsaction]') || el.parentElement;
+                        if (!container) return {};
+                        const nameEl = container.querySelector('.fontHeadlineSmall, .qBF1Pd');
+                        const ratingEl = container.querySelector('.MW4etd');
+                        const reviewEl = container.querySelector('.UY7F9');
+                        const catEl = container.querySelector('.W4Efsd:last-child .W4Efsd > span:nth-child(2) > span:first-child') ||
+                                      container.querySelector('[jsinstance] .W4Efsd > span > span');
+                        return {
+                            name: nameEl ? nameEl.textContent.trim() : '',
+                            rating: ratingEl ? ratingEl.textContent.trim() : '',
+                            reviews: reviewEl ? reviewEl.textContent.replace(/[^0-9]/g, '') : '',
+                            category: catEl ? catEl.textContent.trim().replace(/^·\\s*/, '') : ''
+                        };
+                    }""")
+                    await url_queue.put({"url": href, **(card or {})})
+                    total_pushed += 1
+                except Exception:
+                    pass
+
+            if total_pushed >= max_results:
+                break
+            if curr == prev_count:
+                stuck += 1
+                if stuck >= _MAX_STUCK_SCROLLS:
+                    break
+            else:
+                stuck = 0
+            prev_count = curr
+
+        logger.info("Scraper phase-1 (streaming): pushed %d places for '%s'", total_pushed, query)
+        return total_pushed
 
     if pool is not None and pool.is_started:
         async with pool.page() as page:
@@ -648,13 +771,11 @@ async def scrape_leads(
     counter_lock  = asyncio.Lock()
 
     async def _producer():
-        """Phase 1: scroll feed and push place dicts into the queue."""
+        """Phase 1: scroll feed and stream place dicts into the queue as found."""
         t0 = time.monotonic()
-        place_items = await _collect_place_urls(query, url, max_results, pool)
+        await _stream_place_urls(query, url, max_results, url_queue, pool)
         if metrics:
             metrics.record_phase1(int((time.monotonic() - t0) * 1000))
-        for item in place_items:
-            await url_queue.put(item)
         await url_queue.put(_SENTINEL)
 
     async def _consumer():
@@ -673,6 +794,11 @@ async def scrape_leads(
                 url_queue.task_done()
 
     async def _process_one(item: dict):
+        # Stop if we already have enough leads
+        async with counter_lock:
+            if found_counter["n"] >= max_results:
+                return
+
         place_url = item["url"]
         feed_meta = {k: v for k, v in item.items() if k != "url" and v}
 
@@ -683,6 +809,8 @@ async def scrape_leads(
                 if not _city_matches(detail.get("city", ""), city):
                     return
                 async with counter_lock:
+                    if found_counter["n"] >= max_results:
+                        return
                     leads.append(detail)
                     found_counter["n"] += 1
                     n = found_counter["n"]
@@ -727,6 +855,8 @@ async def scrape_leads(
             await place_cache.set(place_url, detail)
 
         async with counter_lock:
+            if found_counter["n"] >= max_results:
+                return
             leads.append(detail)
             found_counter["n"] += 1
             n = found_counter["n"]

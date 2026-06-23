@@ -151,17 +151,34 @@ class BrowserPool:
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """Launch Chromium and pre-allocate all persistent page slots."""
+        """Launch Chromium and pre-allocate page slots.
+
+        Creates 1 slot immediately (so the first job can start fast),
+        then spawns remaining slots in background.
+        """
         self._available = asyncio.Queue(maxsize=self._max_slots)
         await self._launch_browser()
-        for i in range(self._max_slots):
-            slot = await self._new_slot(i)
-            await self._available.put(slot)
+        # Create first slot immediately — unblocks the first job
+        slot = await self._new_slot(0)
+        await self._available.put(slot)
         self.is_started = True
         logger.info(
-            "BrowserPool started — %d persistent page slots ready",
-            self._max_slots,
+            "BrowserPool started — 1 slot ready, warming %d more in background",
+            self._max_slots - 1,
         )
+        # Warm remaining slots in background (non-blocking)
+        if self._max_slots > 1:
+            asyncio.create_task(self._warm_remaining_slots())
+
+    async def _warm_remaining_slots(self) -> None:
+        """Create remaining browser slots in background after start()."""
+        for i in range(1, self._max_slots):
+            try:
+                slot = await self._new_slot(i)
+                await self._available.put(slot)
+            except Exception as exc:
+                logger.warning("BrowserPool: failed to warm slot %d: %s", i, exc)
+        logger.info("BrowserPool: all %d slots ready", self._max_slots)
 
     async def stop(self) -> None:
         """Drain the pool and close Chromium."""
