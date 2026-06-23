@@ -400,6 +400,73 @@ async def _extrair_detalhe(
     if score >= 80:
         tags.append("alto potencial")
 
+    # ── Digital diagnosis — intelligent service suggestions ─────────────────────
+    needs_website = not has_website
+    needs_social_media = not has_instagram
+    # SEO only if they HAVE a site but are underperforming in search
+    needs_seo = has_website and (review_count < 20 or (rating is not None and rating < 4.0))
+    needs_google_business = review_count < 10 or (rating is not None and rating < 3.5)
+    # Paid traffic only if there's a site to send traffic to
+    needs_paid_traffic = has_website and review_count < 15
+    # Redesign only if site exists but overall digital presence is weak
+    needs_redesign = has_website and not has_instagram and review_count < 10
+    # Automation only for businesses with site + phone + some traction
+    needs_automation = has_website and has_phone and review_count >= 10
+
+    # Digital maturity score (0-100): higher = more digitally mature
+    maturity = 0
+    if has_website:
+        maturity += 30
+    if has_instagram:
+        maturity += 20
+    if has_phone:
+        maturity += 15
+    if review_count >= 20:
+        maturity += 15
+    elif review_count >= 5:
+        maturity += 8
+    if rating and rating >= 4.0:
+        maturity += 10
+    elif rating and rating >= 3.0:
+        maturity += 5
+    if horario:
+        maturity += 10
+    digital_maturity_score = min(100, maturity)
+
+    # Suggested services — only what's RELEVANT given actual presence
+    suggested_services: list[str] = []
+    if needs_website:
+        suggested_services.append("Criação de site")
+    if needs_social_media and (has_website or has_phone):
+        suggested_services.append("Gestão de redes sociais")
+    if needs_seo:
+        suggested_services.append("SEO / Otimização para buscas")
+    if needs_paid_traffic:
+        suggested_services.append("Tráfego pago (Google Ads)")
+    if needs_google_business:
+        suggested_services.append("Google Meu Negócio")
+    if not has_phone:
+        suggested_services.append("WhatsApp Business")
+    if needs_redesign:
+        suggested_services.append("Redesign de site")
+    if needs_automation:
+        suggested_services.append("Automação de atendimento")
+    if review_count < 10:
+        suggested_services.append("Gestão de avaliações")
+
+    digital_diagnosis = {
+        "needs_website": needs_website,
+        "needs_seo": needs_seo,
+        "needs_social_media": needs_social_media,
+        "needs_google_business": needs_google_business,
+        "needs_paid_traffic": needs_paid_traffic,
+        "needs_redesign": needs_redesign,
+        "needs_automation": needs_automation,
+        "digital_maturity_score": digital_maturity_score,
+        "issues": tags[:],
+        "suggested_services": suggested_services,
+    }
+
     return dict(
         name=nome,
         category=categoria,
@@ -417,6 +484,9 @@ async def _extrair_detalhe(
         tags=tags,
         hours=horario,
         photo_url=photo_url,
+        digital_diagnosis=digital_diagnosis,
+        digital_maturity_score=digital_maturity_score,
+        suggested_services=suggested_services,
         status="new",
         source="google_maps",
         # Internal flag consumed by scrape_leads() — not persisted to the DB.
@@ -543,9 +613,9 @@ async def _stream_place_urls(
     max_results: int,
     url_queue: asyncio.Queue,
     pool=None,
-) -> int:
+) -> tuple[int, bool]:
     """Scroll the Maps search feed and push place dicts into url_queue AS they
-    are discovered during scrolling. Returns total items pushed.
+    are discovered during scrolling. Returns (total_pushed, region_exhausted).
 
     This enables consumers to start extracting while scrolling is still ongoing.
     """
@@ -576,7 +646,7 @@ async def _stream_place_urls(
             await page.wait_for_selector(feed_sel, timeout=10_000)
         except Exception:
             logger.warning("Scraper phase-1: feed not found")
-            return 0
+            return 0, False
 
         # Track which URLs we've already pushed to avoid duplicates
         seen_urls: set[str] = set()
@@ -633,8 +703,9 @@ async def _stream_place_urls(
                 stuck = 0
             prev_count = curr
 
-        logger.info("Scraper phase-1 (streaming): pushed %d places for '%s'", total_pushed, query)
-        return total_pushed
+        region_exhausted = (stuck >= _MAX_STUCK_SCROLLS and total_pushed < max_results)
+        logger.info("Scraper phase-1 (streaming): pushed %d places for '%s' (exhausted=%s)", total_pushed, query, region_exhausted)
+        return total_pushed, region_exhausted
 
     if pool is not None and pool.is_started:
         async with pool.page() as page:
@@ -720,7 +791,7 @@ async def scrape_leads(
     pool=None,
     place_cache=None,  # Optional[PlaceCache] — per-URL extraction cache
     metrics=None,      # Optional[JobMetrics] — phase timing instrumentation
-) -> list[dict]:
+) -> dict:
     """
     Scrape Google Maps for businesses matching *keyword* in *city*.
 
@@ -742,7 +813,7 @@ async def scrape_leads(
         place_items = await _collect_place_urls(query, url, max_results, pool=None)
         if not place_items:
             logger.info("Scraper: no URLs collected for '%s'", query)
-            return leads
+            return {"leads": leads, "leads_found": 0, "region_exhausted": True, "requested": max_results}
         for item in place_items:
             if len(leads) >= max_results:
                 break
@@ -761,19 +832,23 @@ async def scrape_leads(
                     await progress_cb(len(leads), detail)
                 except Exception as cb_exc:
                     logger.debug("progress_cb error: %s", cb_exc)
+        # In sequential mode, exhaustion means we got fewer items than requested
+        seq_exhausted = len(place_items) < max_results
         logger.info("Scraper finished: %d leads for '%s' in %s", len(leads), keyword, city)
-        return leads
+        return {"leads": leads, "leads_found": len(leads), "region_exhausted": seq_exhausted, "requested": max_results}
 
     # ── Pipeline mode (pool available) ───────────────────────────────────────
     _SENTINEL = None
     url_queue: asyncio.Queue = asyncio.Queue()
     found_counter = {"n": 0}
     counter_lock  = asyncio.Lock()
+    _region_exhausted = {"value": False}
 
     async def _producer():
         """Phase 1: scroll feed and stream place dicts into the queue as found."""
         t0 = time.monotonic()
-        await _stream_place_urls(query, url, max_results, url_queue, pool)
+        _pushed, exhausted = await _stream_place_urls(query, url, max_results, url_queue, pool)
+        _region_exhausted["value"] = exhausted
         if metrics:
             metrics.record_phase1(int((time.monotonic() - t0) * 1000))
         await url_queue.put(_SENTINEL)
@@ -877,4 +952,9 @@ async def scrape_leads(
         metrics.record_phase2(int((time.monotonic() - t0_phase2) * 1000))
 
     logger.info("Scraper finished: %d leads for '%s' in %s", len(leads), keyword, city)
-    return leads
+    return {
+        "leads": leads,
+        "leads_found": len(leads),
+        "region_exhausted": _region_exhausted["value"],
+        "requested": max_results,
+    }

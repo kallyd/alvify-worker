@@ -361,6 +361,7 @@ async def _process_job(session: aiohttp.ClientSession, job: dict, global_place_c
     _first_lead_flushed = False  # Track whether we've sent the first lead immediately
     leads_sent = 0
     new_leads  = 0
+    _batch_lock = asyncio.Lock()  # Protects _batch and leads_sent from concurrent access
 
     # ── Place cache: reuse global connection or fallback to per-job ───────────
     _place_cache = global_place_cache
@@ -469,10 +470,6 @@ async def _process_job(session: aiohttp.ClientSession, job: dict, global_place_c
         """
         nonlocal leads_sent, new_leads
 
-        # Stop accepting leads if we've already sent enough
-        if leads_sent + len(_batch) >= max_results:
-            return
-
         metrics.lead_scraped()
 
         # DEBUG: log first 3 leads to diagnose dedup issue
@@ -491,8 +488,13 @@ async def _process_job(session: aiohttp.ClientSession, job: dict, global_place_c
             )
             return
 
-        _batch.append(lead_dict)
-        
+        # ── Atomic check-and-append under lock (prevents race condition) ──────
+        async with _batch_lock:
+            # Stop accepting leads if we've already sent/buffered enough
+            if leads_sent + len(_batch) >= max_results:
+                return
+            _batch.append(lead_dict)
+
         logger.info(
             "job=%s lead_added_to_batch n=%d batch_size=%d name=%r",
             job_id, n, len(_batch), lead_dict.get("name"),
