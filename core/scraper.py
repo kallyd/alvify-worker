@@ -946,8 +946,20 @@ async def scrape_leads(
     consumer_tasks = [asyncio.create_task(_consumer()) for _ in range(num_consumers)]
 
     t0_phase2 = time.monotonic()
-    await producer_task
-    await asyncio.gather(*consumer_tasks, return_exceptions=True)
+
+    # Adicionamos um timeout global de segurança para evitar que o worker fique pendurado pra sempre
+    try:
+        await asyncio.wait_for(producer_task, timeout=1200) # 20 minutos máx pro produtor
+    except asyncio.TimeoutError:
+        logger.error("Timeout extremo: O Producer de URLs travou e foi abortado.")
+        # Força os consumidores a terminarem injetando o SENTINEL na fila
+        await url_queue.put(_SENTINEL)
+
+    try:
+        await asyncio.wait_for(asyncio.gather(*consumer_tasks, return_exceptions=True), timeout=1800) # 30 minutos máx
+    except asyncio.TimeoutError:
+        logger.error("Timeout extremo: Os Consumers travaram e foram abortados.")
+
     if metrics:
         metrics.record_phase2(int((time.monotonic() - t0_phase2) * 1000))
 
