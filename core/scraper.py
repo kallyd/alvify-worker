@@ -529,12 +529,40 @@ async def _collect_place_urls(
 
         await _aceitar_cookies(page)
 
+        # ── Fallback 1: Direct match (no feed, just the place detail) ───────
+        try:
+            # Check if Maps bypassed the feed and loaded a specific place directly
+            is_direct = False
+            try:
+                # Wait briefly for a place title (h1.DUwDvf is the standard place title class)
+                await page.wait_for_selector('h1.DUwDvf', timeout=3000)
+                is_direct = True
+            except Exception:
+                pass
+
+            if is_direct:
+                current_url = page.url
+                if "/maps/place/" in current_url:
+                    name_el = page.locator('h1.DUwDvf').first
+                    name_text = await name_el.text_content() if await name_el.count() else ""
+                    logger.info("Scraper phase-1: Direct match found for '%s'", query)
+                    return [{"url": current_url, "name": name_text.strip()}]
+        except Exception as dm_exc:
+            logger.debug("Direct match check failed: %s", dm_exc)
+
+        # ── Fallback 2: Regular feed ──────────────────────────────────────────
         feed_sel = 'div[role="feed"]'
         try:
             await page.wait_for_selector(feed_sel, timeout=10_000)
         except Exception:
-            logger.warning("Scraper phase-1: feed not found")
-            return []
+            # Maybe another selector for feed? (m6QErb is common)
+            feed_sel_fallback = 'div.m6QErb[aria-label]'
+            try:
+                await page.wait_for_selector(feed_sel_fallback, timeout=5_000)
+                feed_sel = feed_sel_fallback
+            except Exception:
+                logger.warning("Scraper phase-1: feed not found (neither role=feed nor m6QErb)")
+                return []
 
         prev_count = 0
         stuck      = 0
@@ -641,12 +669,38 @@ async def _stream_place_urls(
 
         await _aceitar_cookies(page)
 
+        # ── Fallback 1: Direct match (no feed, just the place detail) ───────
+        try:
+            is_direct = False
+            try:
+                await page.wait_for_selector('h1.DUwDvf', timeout=3000)
+                is_direct = True
+            except Exception:
+                pass
+
+            if is_direct:
+                current_url = page.url
+                if "/maps/place/" in current_url:
+                    name_el = page.locator('h1.DUwDvf').first
+                    name_text = await name_el.text_content() if await name_el.count() else ""
+                    logger.info("Scraper phase-1 (streaming): Direct match found for '%s'", query)
+                    await url_queue.put({"url": current_url, "name": name_text.strip()})
+                    return 1, True
+        except Exception:
+            pass
+
+        # ── Fallback 2: Regular feed ──────────────────────────────────────────
         feed_sel = 'div[role="feed"]'
         try:
             await page.wait_for_selector(feed_sel, timeout=10_000)
         except Exception:
-            logger.warning("Scraper phase-1: feed not found")
-            return 0, False
+            feed_sel_fallback = 'div.m6QErb[aria-label]'
+            try:
+                await page.wait_for_selector(feed_sel_fallback, timeout=5_000)
+                feed_sel = feed_sel_fallback
+            except Exception:
+                logger.warning("Scraper phase-1: feed not found (neither role=feed nor m6QErb)")
+                return 0, False
 
         # Track which URLs we've already pushed to avoid duplicates
         seen_urls: set[str] = set()
