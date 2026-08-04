@@ -67,6 +67,8 @@ VERSION:        str = os.environ.get("VERSION", "1.0.0")
 REDIS_URL:      str = os.environ.get("REDIS_URL", "")
 HEALTH_BIND_PORT: int = int(os.environ.get("HEALTH_PORT", "8001"))
 CACHE_REFRESH_QUEUE = "alvify:queue:cache_refresh"
+ENRICH_QUEUE = "alvify:queue:enrich"
+ENRICH_PAUSE_KEY = "alvify:enrichment:pause"
 
 # Batch flush settings
 BATCH_SIZE:    int   = int(os.environ.get("BATCH_SIZE", "50"))
@@ -77,6 +79,7 @@ POLL_URL      = f"{API_URL}/internal/workers/jobs/poll"
 HEARTBEAT_URL = f"{API_URL}/internal/workers/heartbeat"
 BATCH_URL     = f"{API_URL}/internal/workers/jobs/{{job_id}}/leads/batch"
 SINGLE_URL    = f"{API_URL}/internal/workers/jobs/{{job_id}}/lead"
+ENRICH_URL    = f"{API_URL}/internal/workers/enrich"
 
 # Add this file's directory to sys.path so 'core' package is importable
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -623,6 +626,72 @@ async def _process_job(session: aiohttp.ClientSession, job: dict, global_place_c
                 pass
 
 
+# ── Enrichment (idle worker) ─────────────────────────────────────────────────
+
+async def _enrich_lead(session: aiohttp.ClientSession, lead_id: str) -> bool:
+    """Call backend enrichment endpoint for a single lead. Returns True if successful."""
+    try:
+        async with session.post(
+            ENRICH_URL,
+            headers=_worker_headers(),
+            json={"lead_id": lead_id},
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                return data.get("ok", False) and not data.get("paused", False)
+            return False
+    except Exception as exc:
+        logger.debug("enrich_lead error %s: %s", lead_id, exc)
+        return False
+
+
+async def _enrich_poll_loop(session: aiohttp.ClientSession) -> None:
+    """
+    Background enrichment when no scrape jobs are available.
+    Pulls lead_ids from ENRICH_QUEUE (Redis list) and calls the enrich endpoint.
+    Exits quickly when a scrape job arrives (checked via _active_jobs).
+    """
+    if not REDIS_URL:
+        return
+
+    import redis.asyncio as aioredis
+    _r = aioredis.from_url(REDIS_URL, socket_connect_timeout=2)
+
+    while True:
+        # Stop if we have active scrape jobs or scraper is globally disabled
+        if _active_jobs > 0:
+            await asyncio.sleep(1)
+            continue
+
+        try:
+            # Check pause flag
+            paused = await _r.get(ENRICH_PAUSE_KEY)
+            if paused:
+                await asyncio.sleep(2)
+                continue
+
+            # Pop a lead_id to enrich (blocking with short timeout)
+            raw = await _r.blpop(ENRICH_QUEUE, timeout=2)
+            if not raw:
+                # Se deu timeout e não tem raw, ele volta no while.
+                continue
+
+            _, lead_id_b = raw
+            lead_id = lead_id_b.decode() if isinstance(lead_id_b, bytes) else lead_id_b
+
+            logger.info("enrich_start lead=%s", lead_id)
+            ok = await _enrich_lead(session, lead_id)
+            logger.info("enrich_done lead=%s ok=%s", lead_id, ok)
+
+        except Exception as exc:
+            logger.debug("enrich_poll error: %s", exc)
+            await asyncio.sleep(2)
+
+    # never reached
+    await _r.aclose()
+
+
 # ── Cache refresh (background, no user-visible job) ──────────────────────────
 
 async def _refresh_cache_entry(session: aiohttp.ClientSession, params: dict) -> None:
@@ -713,7 +782,8 @@ async def _poll_loop(session: aiohttp.ClientSession, global_place_cache=None) ->
     while True:
         # Back-pressure: wait if we are already at capacity
         if _active_jobs >= MAX_CONCURRENCY:
-            await asyncio.sleep(2)
+            # Sleep 0 (yield) ou sleep(0.5) to avoid thrashing cpu, not 2s
+            await asyncio.sleep(0.5)
             continue
 
         # ── Optional: consume cache-refresh queue (direct Redis) ──────────────
@@ -824,6 +894,7 @@ async def main() -> None:
         await asyncio.gather(
             _heartbeat_loop(session),
             _poll_loop(session, _global_place_cache),
+            _enrich_poll_loop(session),
             _health_server(),
         )
 
