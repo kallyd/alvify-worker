@@ -550,27 +550,36 @@ async def _collect_place_urls(
         except Exception as dm_exc:
             logger.debug("Direct match check failed: %s", dm_exc)
 
-        # ── Fallback 2: Regular feed ──────────────────────────────────────────
-        feed_sel = 'div[role="feed"]'
+        # ── Fallback 2: Dynamic scroll container ──────────────────────────────
         try:
-            await page.wait_for_selector(feed_sel, timeout=10_000)
+            # Wait for at least one place link to appear anywhere on the page
+            await page.wait_for_selector('a[href*="/maps/place/"]', timeout=10_000)
         except Exception:
-            # Maybe another selector for feed? (m6QErb is common)
-            feed_sel_fallback = 'div.m6QErb[aria-label]'
-            try:
-                await page.wait_for_selector(feed_sel_fallback, timeout=5_000)
-                feed_sel = feed_sel_fallback
-            except Exception:
-                logger.warning("Scraper phase-1: feed not found (neither role=feed nor m6QErb)")
-                return []
+            logger.warning("Scraper phase-1: no place links found")
+            return []
+
+        # JS snippet to scroll the nearest scrollable ancestor of the first place link
+        scroll_js = f"""() => {{
+            const links = Array.from(document.querySelectorAll("a[href*='/maps/place/']"));
+            if (!links.length) return false;
+            let el = links[0];
+            while(el && el.parentElement) {{
+                el = el.parentElement;
+                if (el.scrollHeight > el.clientHeight && getComputedStyle(el).overflowY !== "visible") {{
+                    el.scrollBy(0, {_SCROLL_PX});
+                    return true;
+                }}
+            }}
+            return false;
+        }}"""
 
         prev_count = 0
         stuck      = 0
         max_scrolls = max(5, max_results // 5 + 4)
         for _ in range(max_scrolls):
-            await page.eval_on_selector(feed_sel, f"el=>el.scrollBy(0,{_SCROLL_PX})")
+            await page.evaluate(scroll_js)
             await asyncio.sleep(_SCROLL_PAUSE_S)
-            curr = await page.locator(f'{feed_sel} a[href*="/maps/place/"]').count()
+            curr = await page.locator('a[href*="/maps/place/"]').count()
             if curr >= max_results:
                 break
             if curr == prev_count:
@@ -581,7 +590,7 @@ async def _collect_place_urls(
                 stuck = 0
             prev_count = curr
 
-        links_loc = page.locator(f'{feed_sel} a[href*="/maps/place/"]')
+        links_loc = page.locator('a[href*="/maps/place/"]')
         total = min(await links_loc.count(), max_results)
         results: list[dict] = []
         for i in range(total):
@@ -689,18 +698,26 @@ async def _stream_place_urls(
         except Exception:
             pass
 
-        # ── Fallback 2: Regular feed ──────────────────────────────────────────
-        feed_sel = 'div[role="feed"]'
+        # ── Fallback 2: Dynamic scroll container ──────────────────────────────
         try:
-            await page.wait_for_selector(feed_sel, timeout=10_000)
+            await page.wait_for_selector('a[href*="/maps/place/"]', timeout=10_000)
         except Exception:
-            feed_sel_fallback = 'div.m6QErb[aria-label]'
-            try:
-                await page.wait_for_selector(feed_sel_fallback, timeout=5_000)
-                feed_sel = feed_sel_fallback
-            except Exception:
-                logger.warning("Scraper phase-1: feed not found (neither role=feed nor m6QErb)")
-                return 0, False
+            logger.warning("Scraper phase-1: no place links found")
+            return 0, False
+
+        scroll_js = f"""() => {{
+            const links = Array.from(document.querySelectorAll("a[href*='/maps/place/']"));
+            if (!links.length) return false;
+            let el = links[0];
+            while(el && el.parentElement) {{
+                el = el.parentElement;
+                if (el.scrollHeight > el.clientHeight && getComputedStyle(el).overflowY !== "visible") {{
+                    el.scrollBy(0, {_SCROLL_PX});
+                    return true;
+                }}
+            }}
+            return false;
+        }}"""
 
         # Track which URLs we've already pushed to avoid duplicates
         seen_urls: set[str] = set()
@@ -710,11 +727,11 @@ async def _stream_place_urls(
         max_scrolls = max(5, max_results // 5 + 4)
 
         for _ in range(max_scrolls):
-            await page.eval_on_selector(feed_sel, f"el=>el.scrollBy(0,{_SCROLL_PX})")
+            await page.evaluate(scroll_js)
             await asyncio.sleep(_SCROLL_PAUSE_S)
 
             # Extract NEW cards that appeared after this scroll
-            links_loc = page.locator(f'{feed_sel} a[href*="/maps/place/"]')
+            links_loc = page.locator('a[href*="/maps/place/"]')
             curr = await links_loc.count()
 
             # Push any new cards immediately
